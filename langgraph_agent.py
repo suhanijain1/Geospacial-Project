@@ -19,7 +19,11 @@ from typing import Dict, Any, List
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph
 
-# Hardcoded API keys
+from artifact import ArtifactRegistry
+
+artifact_registry = ArtifactRegistry()
+
+# Initialising API keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CORE_STACK_API_KEY = os.getenv("CORE_STACK_API_KEY")
 
@@ -47,6 +51,14 @@ def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
         state["parsed"] = parsed
     except Exception as e:
         state["error"] = f"LLM output not valid JSON: {content}"
+    
+    # Register artifact
+    artifact_id = artifact_registry.register(
+        "llm_intent",
+        {"user_query": user_query, "parsed": state.get("parsed"), "error": state.get("error")},
+        parent_id=state.get("artifact_id")
+    )
+    state["artifact_id"] = artifact_id
     return state
 
 def canonicalize_year(year):
@@ -78,6 +90,14 @@ def validate(state: Dict[str, Any]) -> Dict[str, Any]:
     parsed["start_year"] = canonicalize_year(start_year)
     parsed["end_year"] = canonicalize_year(end_year)
     state["parsed"] = parsed
+    
+    # Register artifact
+    artifact_id = artifact_registry.register(
+        "validate",
+        {"parsed": state.get("parsed"), "error": state.get("error")},
+        parent_id=state.get("artifact_id")
+    )
+    state["artifact_id"] = artifact_id
     return state
 
 def fetch_mws_data(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,15 +159,15 @@ def fetch_mws_data(state: Dict[str, Any]) -> Dict[str, Any]:
     mws_json = response.json()
     print(f"API Response keys: {list(mws_json.keys())}")
     state["mws_json"] = mws_json
+    
+    # Register artifact
+    artifact_id = artifact_registry.register(
+        "fetch_mws_data",
+        {"mws_json": state.get("mws_json"), "error": state.get("error")},
+        parent_id=state.get("artifact_id")
+    )
+    state["artifact_id"] = artifact_id
     return state
-    response = requests.get(f"{base_url}get_mws_data/", params=params_mws_data, headers=headers)
-    
-    print(f"API Response Status: {response.status_code}")
-    if response.status_code != 200:
-        state["error"] = f"Step 2 API call failed with status {response.status_code}: {response.text}"
-        return state
-    
-    mws_json = response.json()
     print(f"API Response keys: {list(mws_json.keys())}")
     state["mws_json"] = mws_json
     return state
@@ -269,33 +289,27 @@ def normalize_data(state: Dict[str, Any]) -> Dict[str, Any]:
         state["timeseries"] = rows
         state["metric_block"] = data_block
         state["metric_key_prefix"] = key_prefix
+        
+        # Register artifact
+        artifact_id = artifact_registry.register(
+            "normalize_data",
+            {"timeseries": state.get("timeseries"), "error": state.get("error")},
+            parent_id=state.get("artifact_id")
+        )
+        state["artifact_id"] = artifact_id
         return state
         
     except Exception as e:
         state["error"] = f"Error using LLM to analyze data structure: {str(e)}"
+        
+        # Register artifact
+        artifact_id = artifact_registry.register(
+            "normalize_data",
+            {"timeseries": state.get("timeseries"), "error": state.get("error")},
+            parent_id=state.get("artifact_id")
+        )
+        state["artifact_id"] = artifact_id
         return state
-    
-    # Extract data from the appropriate block
-    data = mws_json.get(data_block, [{}])[0]
-    print(f"{data_block} keys:", list(data.keys())[:10])  # Debug print first 10 keys
-    
-    # Extract timeseries data
-    for k, v in data.items():
-        if isinstance(v, (int, float)) and k.startswith(key_prefix):
-            # Extract year from pattern like 'prefix_2017-2018'
-            year = k.replace(key_prefix, '')
-            if year.count("-") == 1:  # Validate year format
-                rows.append({
-                    "year": year,
-                    "value": v,
-                    "source": f"{data_block}.{k}"
-                })
-    
-    print("Available years in timeseries:", [r["year"] for r in rows])
-    state["timeseries"] = rows
-    state["metric_block"] = data_block
-    state["metric_key_prefix"] = key_prefix
-    return state
 
 def compute_timeseries_stats(state: Dict[str, Any]) -> Dict[str, Any]:
     if "error" in state:
@@ -354,26 +368,14 @@ def compute_timeseries_stats(state: Dict[str, Any]) -> Dict[str, Any]:
         "requested_start_year": requested_start_year,
         "requested_end_year": requested_end_year
     }
-    return state
-    peak_year, peak_value = peak_row['year'], float(peak_row['value'])
-    ys = [r['value'] for r in ts]
-    xs = list(range(len(ys)))
-    slope = 0.0
-    if len(xs) >= 2:
-        mean_x, mean_y = statistics.mean(xs), statistics.mean(ys)
-        num = sum((xi-mean_x)*(yi-mean_y) for xi,yi in zip(xs,ys))
-        den = sum((xi-mean_x)**2 for xi in xs)
-        slope = num/den if den != 0 else 0.0
-    sources = [r['source'] for r in ts if r['year'] in (start_year, end_year, peak_year)]
-    state["stats"] = {
-        "start_val": start_val,
-        "end_val": end_val,
-        "percent_change": round(pct_change, 4) if pct_change is not None else None,
-        "peak_year": peak_year,
-        "peak_value": peak_value,
-        "slope": slope,
-        "sources": sources
-    }
+    
+    # Register artifact
+    artifact_id = artifact_registry.register(
+        "compute_stats",
+        {"stats": state.get("stats"), "error": state.get("error")},
+        parent_id=state.get("artifact_id")
+    )
+    state["artifact_id"] = artifact_id
     return state
 
 def format_response(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -383,6 +385,14 @@ def format_response(state: Dict[str, Any]) -> Dict[str, Any]:
     
     if "error" in state:
         state["response"] = state["error"]
+        
+        # Register artifact
+        artifact_id = artifact_registry.register(
+            "format_response",
+            {"response": state.get("response"), "error": state.get("error")},
+            parent_id=state.get("artifact_id")
+        )
+        state["artifact_id"] = artifact_id
         return state
     
     parsed = state["parsed"]
@@ -406,6 +416,14 @@ def format_response(state: Dict[str, Any]) -> Dict[str, Any]:
     
     if "error" in stats:
         state["response"] = stats["error"]
+        
+        # Register artifact
+        artifact_id = artifact_registry.register(
+            "format_response",
+            {"response": state.get("response"), "error": state.get("error")},
+            parent_id=state.get("artifact_id")
+        )
+        state["artifact_id"] = artifact_id
         return state
     
     # Note if we had to use different years than requested
@@ -419,6 +437,14 @@ def format_response(state: Dict[str, Any]) -> Dict[str, Any]:
         f"Net change {actual_start_year}→{actual_end_year} ≈ {stats['percent_change']}%.{year_note} "
         f"Data sources: {', '.join(stats['sources'])}."
     )
+    
+    # Register artifact
+    artifact_id = artifact_registry.register(
+        "format_response",
+        {"response": state.get("response"), "error": state.get("error")},
+        parent_id=state.get("artifact_id")
+    )
+    state["artifact_id"] = artifact_id
     return state
 
 def router(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -476,6 +502,34 @@ def run_agent(user_query: str):
     result_state = app.invoke(state)
     print("\n--- Final Agent Response ---\n")
     print(result_state["response"])
+    
+    # Show artifact lineage
+    artifact_id = result_state.get("artifact_id")
+    if artifact_id:
+        print("\n--- Artifact Lineage ---")
+        lineage = []
+        current_id = artifact_id
+        
+        # Build lineage chain backwards
+        while current_id:
+            artifact = artifact_registry.get(current_id)
+            if not artifact:
+                break
+            lineage.append(artifact)
+            current_id = artifact["parent_id"]
+        
+        # Print lineage in chronological order (oldest to newest)
+        for i, artifact in enumerate(reversed(lineage)):
+            print(f"\n{i+1}. Artifact: {artifact['type']} | ID: {artifact['id']}")
+            print(f"   Content keys: {list(artifact['content'].keys()) if isinstance(artifact['content'], dict) else 'Non-dict content'}")
+            if artifact.get('parent_id'):
+                print(f"   Parent ID: {artifact['parent_id']}")
+        
+        # Show registry stats
+        stats = artifact_registry.get_stats()
+        print(f"\n--- Registry Stats ---")
+        print(f"Total artifacts: {stats['total_artifacts']}")
+        print("By type:", stats['by_type'])
 
 # --- Example usage ---
 if __name__ == "__main__":
