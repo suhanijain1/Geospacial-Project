@@ -20,9 +20,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph
 
 # Hardcoded API keys
-GEMINI_API_KEY = "AIzaSyBzShXkHj_oykdMribVGztXo4WEaLmi7_s"
-CORE_STACK_API_KEY = "sQtPsffC.UZ0NdPe1ewdTMM9UWJ3KM577kQdH9Luv"
-os.environ["CORE_STACK_API_KEY"] = CORE_STACK_API_KEY
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+CORE_STACK_API_KEY = os.getenv("CORE_STACK_API_KEY")
 
 # --- Node functions ---
 def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
