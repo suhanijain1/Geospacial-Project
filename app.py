@@ -1,9 +1,10 @@
 import streamlit as st
-import sys
-from pathlib import Path
+import os
 
-# Import your agent
-from langgraph_agent import run_agent, graph
+# Disable artifact registry before importing agent
+os.environ['DISABLE_ARTIFACT_REGISTRY'] = '1'
+
+from langgraph_agent import graph
 
 st.set_page_config(
     page_title="Geospatial Analysis Agent",
@@ -31,25 +32,20 @@ with st.sidebar:
     
     st.subheader("Timeseries Analysis")
     if st.button("Cropping intensity 2017-2023", use_container_width=True):
-        query = "How did cropping intensity change from 2017 to 2023 at latitude 25.31698754297551, longitude 75.09702609349773?"
-        st.session_state.selected_query = query
+        st.session_state.selected_query = "How did cropping intensity change from 2017 to 2023 at latitude 25.31698754297551, longitude 75.09702609349773?"
     
     if st.button("Precipitation trend", use_container_width=True):
-        query = "What was the precipitation trend from 2017 to 2023 at latitude 25.31698754297551, longitude 75.09702609349773?"
-        st.session_state.selected_query = query
+        st.session_state.selected_query = "What was the precipitation trend from 2017 to 2023 at latitude 25.31698754297551, longitude 75.09702609349773?"
     
     st.subheader("Spatial Analysis")
     if st.button("Water bodies count", use_container_width=True):
-        query = "How many water bodies are within 1km of coordinates 25.317, 75.097?"
-        st.session_state.selected_query = query
+        st.session_state.selected_query = "How many water bodies are within 1km of coordinates 25.317, 75.097?"
     
     if st.button("Vegetation index", use_container_width=True):
-        query = "What's the average vegetation index around latitude 25.31, longitude 75.09?"
-        st.session_state.selected_query = query
+        st.session_state.selected_query = "What's the average vegetation index around latitude 25.31, longitude 75.09?"
     
     if st.button("Land use analysis", use_container_width=True):
-        query = "Analyze land use distribution around latitude 25.317, longitude 75.097"
-        st.session_state.selected_query = query
+        st.session_state.selected_query = "Analyze land use distribution around latitude 25.317, longitude 75.097"
 
 # Use selected query from sidebar if available
 if 'selected_query' in st.session_state:
@@ -120,40 +116,37 @@ if st.session_state.history:
                     st.markdown(f"**Location:** {location}")
                     
                     # Extract key metrics
-                    lines = []
-                    if "changed from" in analysis:
-                        # Parse the change information
-                        import re
+                    import re
+                    
+                    # Extract values
+                    start_match = re.search(r'from ([\d.]+) \(([\d-]+)\)', analysis)
+                    peak_match = re.search(r'peak of ([\d.]+) \(([\d-]+)\)', analysis)
+                    end_match = re.search(r'is ([\d.]+) in ([\d-]+)', analysis)
+                    change_match = re.search(r'≈ ([-\d.]+)%', analysis)
+                    
+                    if start_match and end_match:
+                        col1, col2, col3 = st.columns(3)
                         
-                        # Extract values
-                        start_match = re.search(r'from ([\d.]+) \(([\d-]+)\)', analysis)
-                        peak_match = re.search(r'peak of ([\d.]+) \(([\d-]+)\)', analysis)
-                        end_match = re.search(r'is ([\d.]+) in ([\d-]+)', analysis)
-                        change_match = re.search(r'≈ ([-\d.]+)%', analysis)
+                        with col1:
+                            st.metric(
+                                label=f"Start ({start_match.group(2)})",
+                                value=start_match.group(1)
+                            )
                         
-                        if start_match and end_match:
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
+                        with col2:
+                            if peak_match:
                                 st.metric(
-                                    label=f"Start ({start_match.group(2)})",
-                                    value=start_match.group(1)
+                                    label=f"Peak ({peak_match.group(2)})",
+                                    value=peak_match.group(1)
                                 )
-                            
-                            with col2:
-                                if peak_match:
-                                    st.metric(
-                                        label=f"Peak ({peak_match.group(2)})",
-                                        value=peak_match.group(1)
-                                    )
-                            
-                            with col3:
-                                change_val = change_match.group(1) if change_match else "N/A"
-                                st.metric(
-                                    label=f"Current ({end_match.group(2)})",
-                                    value=end_match.group(1),
-                                    delta=f"{change_val}% overall change"
-                                )
+                        
+                        with col3:
+                            change_val = change_match.group(1) if change_match else "N/A"
+                            st.metric(
+                                label=f"Current ({end_match.group(2)})",
+                                value=end_match.group(1),
+                                delta=f"{change_val}% overall change"
+                            )
                         
                         # Show data sources in expander
                         if "Data sources:" in analysis:
@@ -163,7 +156,7 @@ if st.session_state.history:
                                 for src in source_list:
                                     st.caption(f"• {src}")
                     else:
-                        # Non-timeseries response, show as is
+                        # Parsing failed, show as-is
                         st.success(response)
                 else:
                     # For spatial or other analysis types
