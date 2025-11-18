@@ -11,7 +11,6 @@ Base URL: https://geoserver.core-stack.org/api/v1/
 Authentication: X-API-Key header
 
 API ENDPOINTS & WORKFLOWS:
----------------------------
 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ WORKFLOW 1: SPATIAL LAYER ACCESS (for spatial analysis queries)        │
@@ -74,12 +73,6 @@ LangGraph Workflow:
 6. format: Create user-friendly response with LLM
 
 Key Features:
-- Proper API coupling (no mixing workflows)
-- Clear logging with 📡 API calls and 📦 responses
-- CodeAct planning phase (human-readable steps)
-- Automatic geocoding for place names
-- Fallback search for nearby watersheds
-- Error handling and graceful degradation
 
 ================================================================================
 """
@@ -202,6 +195,12 @@ class CoreStackAPI:
             vector_count = sum(1 for l in layers if l.get('layer_type') == 'vector')
             raster_count = sum(1 for l in layers if l.get('layer_type') == 'raster')
             print(f"📦 RESPONSE: {len(layers)} total layers ({vector_count} vector, {raster_count} raster)")
+            # Print layer names only (not full details)
+            layer_names = [l.get('layer_name', 'Unknown') for l in layers[:5]]
+            if len(layers) > 5:
+                print(f"   First 5 layers: {', '.join(layer_names)} ... (+{len(layers)-5} more)")
+            else:
+                print(f"   Layers: {', '.join(layer_names)}")
             return layers
         else:
             error_msg = f"Layer fetch failed: {response.text}"
@@ -454,14 +453,24 @@ class SpatialDataProcessor:
                 gdf = gdf[gdf.intersects(buffer_geom)]
                 print(f"🔍 FILTERED: {len(gdf)} features within {buffer_km}km")
             
-            # Calculate statistics
+            # Calculate statistics (reproject to UTM for accurate area calculation)
             stats = {
                 'feature_count': len(gdf),
-                'total_area_ha': gdf.geometry.area.sum() / 10000 if len(gdf) > 0 else 0,
                 'columns': list(gdf.columns),
                 'attributes': {},
                 'sample_features': []
             }
+            
+            # Calculate area in hectares (reproject to UTM zone for India: EPSG:32643)
+            if len(gdf) > 0:
+                try:
+                    gdf_projected = gdf.to_crs('EPSG:32643')  # UTM Zone 43N for India
+                    stats['total_area_ha'] = gdf_projected.geometry.area.sum() / 10000  # m² to ha
+                except:
+                    stats['total_area_ha'] = 0
+                    stats['area_calculation_error'] = 'Could not reproject for area calculation'
+            else:
+                stats['total_area_ha'] = 0
             
             # Extract numeric attributes
             for col in gdf.columns:
@@ -499,7 +508,7 @@ class SpatialDataProcessor:
         Process raster data from URL using HTTP range requests
         
         Args:
-            url: GeoTIFF URL
+            url: GeoTIFF URL (will be automatically prefixed with /vsicurl/ if needed)
             bounds: (minx, miny, maxx, maxy) bounding box
             circle_geom_4326: Shapely geometry for masking
         
@@ -507,8 +516,21 @@ class SpatialDataProcessor:
             Dict with statistics
         """
         print(f"\n📡 PROCESSING RASTER: {url[:100]}...")
+        print(f"🔍 DEBUG: Function called with circle_geom={circle_geom_4326 is not None}, bounds={bounds}")
+        
+        # Prefix with /vsicurl/ if it's an HTTP URL without it
+        if url.startswith('http') and not url.startswith('/vsicurl/'):
+            url = f'/vsicurl/{url}'
+            print(f"🔍 DEBUG: Added /vsicurl/ prefix")
         
         try:
+            # Enable GDAL options for better WCS support
+            import os
+            os.environ['GDAL_HTTP_UNSAFESSL'] = 'YES'
+            os.environ['CPL_VSIL_CURL_ALLOWED_EXTENSIONS'] = '.tif,.tiff,.vrt'
+            print(f"🔍 DEBUG: Set GDAL environment variables")
+            
+            print(f"🔍 DEBUG: Opening raster with rasterio...")
             with rasterio.open(url) as src:
                 # Get raster info
                 print(f"📦 RASTER INFO: {src.width}x{src.height}, CRS: {src.crs}")
@@ -518,19 +540,38 @@ class SpatialDataProcessor:
                     window = src.window(*bounds)
                     data = src.read(1, window=window)
                 elif circle_geom_4326:
-                    # Mask with geometry
-                    out_image, out_transform = mask(src, [circle_geom_4326], crop=True)
-                    data = out_image[0]
+                    # Get window from circle bounds
+                    minx, miny, maxx, maxy = circle_geom_4326.bounds
+                    print(f"📦 Circle bounds: ({minx:.4f}, {miny:.4f}, {maxx:.4f}, {maxy:.4f})")
+                    try:
+                        window = src.window(minx, miny, maxx, maxy)
+                        data = src.read(1, window=window)
+                        print(f"📦 Window read: {data.shape}, non-zero pixels: {np.count_nonzero(data)}")
+                    except Exception as e:
+                        print(f"⚠️  Window read failed, trying full read with mask: {e}")
+                        # Fallback: read full and mask
+                        from rasterio.mask import mask as rio_mask
+                        out_image, out_transform = rio_mask(src, [circle_geom_4326], crop=True, filled=False)
+                        data = out_image[0]
                 else:
                     # Read full raster
                     data = src.read(1)
                 
                 # Filter nodata
                 nodata = src.nodata
+                print(f"📦 Nodata value: {nodata}")
+                print(f"📦 Data shape: {data.shape}, dtype: {data.dtype}")
+                print(f"📦 Data range: min={np.min(data)}, max={np.max(data)}")
+                print(f"📦 Unique values: {np.unique(data)[:10]}")  # First 10 unique values
+                
+                # Filter nodata - handle multiple common nodata values
                 if nodata is not None:
                     valid_data = data[data != nodata]
                 else:
-                    valid_data = data.flatten()
+                    # Common nodata values if not specified
+                    valid_data = data[(data != 0) & (data != -9999) & (data != 255) & (~np.isnan(data))]
+                
+                print(f"📦 Valid pixels: {len(valid_data)} out of {data.size}")
                 
                 # Calculate statistics
                 if len(valid_data) > 0:
@@ -542,8 +583,10 @@ class SpatialDataProcessor:
                         'max': float(np.max(valid_data)),
                         'pixel_count': int(len(valid_data))
                     }
+                    print(f"✅ Stats: mean={stats['mean']:.2f}, pixels={stats['pixel_count']}")
                 else:
-                    stats = {'error': 'No valid data in raster'}
+                    stats = {'error': 'No valid data in raster', 'total_pixels': int(data.size), 'nodata_value': nodata}
+                    print(f"❌ No valid data found!")
                 
                 return stats
                 
@@ -666,6 +709,7 @@ AVAILABLE FUNCTIONS:
     - 'sample_features': list of first 3 feature dicts (without geometry)
 - SpatialDataProcessor.process_raster_url(url, bounds=None, circle_geom_4326=None) → dict with stats
 - geodesic_buffer(lon, lat, radius_m, out_crs="EPSG:4326") → circle geometry (standalone function!)
+  **IMPORTANT**: For raster analysis, use radius_m >= 1000 (1km+) to capture sufficient pixels
 - find_layer(layer_list, search_term) → dict (helper to find layers with fuzzy matching - RECOMMENDED!)
 
 VARIABLES IN SCOPE:
@@ -683,7 +727,10 @@ CODE GENERATION RULES:
 3. Store final result in variable called 'result' (dict or string)
 4. Handle errors gracefully (try-except where needed)
 5. For vector data: use process_vector_url()
-6. For raster data: use process_raster_url()
+6. For raster data: use process_raster_url() with geodesic_buffer(lon, lat, radius_m)
+   - **CRITICAL**: Use radius_m >= 1000 (at least 1km) for rasters to capture enough pixels
+   - For point queries: use 1000-5000m radius
+   - For "around/near" queries: use 5000-10000m radius
 7. DO NOT import additional libraries beyond what's available
 8. Keep it simple and focused on answering the query
 9. **CRITICAL**: When searching for layers, use EXACT MATCHING with the layer names provided above
@@ -697,44 +744,46 @@ LAYER MATCHING EXAMPLES:
 - Manual exact match: if layer['layer_name'] == 'Cropping Intensity'
 - Manual case-insensitive: if 'cropping intensity' in layer['layer_name'].lower()
 
-EXAMPLE CODE STRUCTURE (RECOMMENDED APPROACH):
+EXAMPLE CODE FOR VECTOR DATA:
 ```python
 # Use find_layer helper for robust layer matching
 target_layer = find_layer(vector_layers, 'Cropping Intensity')
 
 if target_layer:
-    # Process the layer
     stats = SpatialDataProcessor.process_vector_url(
         target_layer['layer_url'],
         point=(query_lat, query_lon),
         buffer_km=5.0
     )
     
-    # Access the results:
-    # - stats['feature_count'] → number of features
-    # - stats['columns'] → list of all column names
-    # - stats['attributes']['doubly_cropped_area_2023']['sum'] → total area
-    # - stats['sample_features'][0]['doubly_cropped_area_2023'] → first feature's value
-    
     result = {{
         'total_area': stats['attributes']['doubly_cropped_area_2023']['sum']
     }}
 else:
     result = {{'error': 'Layer not found'}}
-        target_layer = layer
-        break
+```
 
-if target_layer:
-    point = (query_lat, query_lon) if query_lat and query_lon else None
-    stats = SpatialDataProcessor.process_vector_url(target_layer['layer_url'], point, buffer_km=1.0)
+EXAMPLE CODE FOR RASTER DATA:
+```python
+# Find LULC or NDVI raster layer
+lulc_layer = find_layer(raster_layers, 'LULC_level_1')
+
+if lulc_layer:
+    # Create buffer geometry (use 1-10km radius for rasters!)
+    buffer_geom = geodesic_buffer(query_lon, query_lat, 5000, out_crs="EPSG:4326")
+    
+    # Process raster
+    stats = SpatialDataProcessor.process_raster_url(
+        lulc_layer['layer_url'],
+        circle_geom_4326=buffer_geom
+    )
     
     result = {{
-        'layer': target_layer['layer_name'],
-        'feature_count': stats.get('feature_count', 0),
-        'total_area_ha': stats.get('total_area_ha', 0)
+        'mean_value': stats.get('mean'),
+        'pixel_count': stats.get('pixel_count')
     }}
 else:
-    result = {{'error': 'Required layer not found'}}
+    result = {{'error': 'Layer not found'}}
 ```
 
 NOW GENERATE CODE (Python only, no markdown):"""
@@ -988,25 +1037,8 @@ def fetch_timeseries_data(state: Dict[str, Any]) -> Dict[str, Any]:
             timeseries_data = api.get_mws_data(uid)
             watershed_info = {"uid": uid}
         elif latitude and longitude:
-            # Get watershed and timeseries from coordinates
-            # Try exact location first, then search nearby
-            try:
-                watershed_info, timeseries_data = api.get_timeseries_by_coordinates(latitude, longitude)
-            except:
-                print("⚠️  No watershed at exact location, searching nearby...")
-                watershed_info = api.find_nearest_watershed(latitude, longitude, max_distance_km=10.0)
-                
-                if watershed_info:
-                    uid = watershed_info.get('uid')
-                    timeseries_data = api.get_mws_data(uid)
-                    
-                    # Add distance info to parsed state
-                    if watershed_info.get('distance_km', 0) > 0:
-                        parsed['distance_to_watershed_km'] = watershed_info['distance_km']
-                        parsed['original_latitude'] = latitude
-                        parsed['original_longitude'] = longitude
-                else:
-                    raise Exception("No watershed found within 10km")
+            # Get watershed and timeseries from coordinates (direct lookup only, no search)
+            watershed_info, timeseries_data = api.get_timeseries_by_coordinates(latitude, longitude)
         else:
             raise Exception("Either UID or coordinates required for timeseries data")
         
@@ -1317,4 +1349,4 @@ if __name__ == "__main__":
     print("="*70)
     
     # Run first spatial query
-    run_agent("for jharkhand, please provide total degraded land area in hectares as a histogram over the years 2020 to 2023")
+    run_agent("What's the vegetation cover around coordinates 25.31, 75.09?")
