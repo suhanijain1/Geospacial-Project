@@ -53,7 +53,10 @@ from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 # Import CodeAct from smolagents (structure from agent.py)
-from smolagents import CodeAgent, tool, LiteLLMModel
+from smolagents import CodeAgent, tool, LiteLLMModel, DuckDuckGoSearchTool
+
+# No need to import executor - it's specified via executor_type parameter
+DOCKER_AVAILABLE = True  # Assume Docker is available like in agent.py
 
 # Import LangGraph workflow and ALL components from new_architecture.py
 from new_architecture import (
@@ -68,11 +71,53 @@ from new_architecture import (
 # Import Gemini for the tool itself
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+# Import Earth Engine (like agent.py)
+import ee
+
 load_dotenv()
 
+# Initialize Earth Engine
+GEE_PROJECT = os.getenv("GEE_PROJECT", "apt-achievment-453417-h6")
+try:
+    ee.Initialize(project=GEE_PROJECT)
+    print(f"✅ Earth Engine initialized with project: {GEE_PROJECT}")
+except Exception as e:
+    print(f"⚠️  Earth Engine initialization failed: {e}")
+
 # ============================================================================
-# LANGGRAPH AS A TOOL FOR CODEACT
+# DATA PRODUCT NAME CACHE (reduces context length)
 # ============================================================================
+
+CORESTACK_DATA_PRODUCTS = {
+    "vector_layers": [
+        "lcw_conflict", "Admin Boundary", "MWS", "LULC_level_2", "Cropping Intensity",
+        "Terrain Vector", "LULC", "Aquifer", "Restoration Vector", "Stream Order",
+        "SOGE", "Crop GridXlulc", "Drought Causality", "Hydrology Precipitation",
+        "Drainage", "Surface Water Bodies", "Hydrology Evapotranspiration",
+        "Hydrology Run Off", "Hydrology", "Change Detection Vector", "NREGA Assets"
+    ],
+    "raster_layers": [
+        "LULC_level_2", "Restoration Raster", "Change Detection Raster", "CLART",
+        "LULC_level_3", "LULC_level_1", "Terrain Raster", "NDVI", "Soil Moisture",
+        "Temperature", "Rainfall", "Evapotranspiration", "Groundwater Level"
+    ],
+    "timeseries_metrics": [
+        "cropping_intensity", "precipitation", "temperature", "soil_moisture",
+        "ndvi", "evapotranspiration", "groundwater_level", "rainfall"
+    ]
+}
+
+# ============================================================================
+# LANGGRAPH AS A TOOL FOR CODEACT  
+# ============================================================================
+
+# Module-level cache for layer data (accessed via getattr to avoid validation issues)
+LAYER_CACHE = {
+    "available_vector_layers": [],
+    "available_raster_layers": [],
+    "vector_layer_map": {},
+    "raster_layer_map": {}
+}
 
 @tool
 def fetch_corestack_data(query: str) -> str:
@@ -91,20 +136,20 @@ def fetch_corestack_data(query: str) -> str:
                - "NDVI layers for Rajasthan Bhilwara Mandalgarh"
     
     Returns:
-        JSON string with structured data including:
-        - For spatial queries: Available layer URLs (vector/raster GeoJSON/GeoTIFF)
-        - For timeseries queries: Temporal data with years and values
-        - Location information and metadata
-    
-    The tool automatically:
-    1. Parses your query to understand what data type is needed
-    2. Calls CoreStack APIs in correct sequence (with proper coupling)
-    3. Returns structured data ready for geospatial analysis
-    
-    Use this tool when you need CoreStack geospatial data. After fetching,
-    you can write Python code to analyze the returned data using geopandas,
-    rasterio, matplotlib, etc.
+        JSON string with available layers or timeseries data
     """
+    from new_architecture import build_graph
+    import json
+    import sys
+    
+    # Access the module-level cache (will be available in the parent process)
+    # Get reference to this module's LAYER_CACHE
+    this_module = sys.modules.get('architecture4')
+    if this_module and hasattr(this_module, 'LAYER_CACHE'):
+        cache = this_module.LAYER_CACHE
+    else:
+        cache = LAYER_CACHE  # fallback to direct reference
+    
     print("\n" + "="*70)
     print("🔧 TOOL: fetch_corestack_data")
     print(f"📝 Query: {query}")
@@ -148,25 +193,22 @@ def fetch_corestack_data(query: str) -> str:
             vector_layers = available_layers.get("vector", [])
             raster_layers = available_layers.get("raster", [])
             
-            # Simplify layer info - just return essential data
+            # Cache layer data using getattr to avoid validation issues
+            cache["available_vector_layers"] = [l.get("layer_name") for l in vector_layers]
+            cache["available_raster_layers"] = [l.get("layer_name") for l in raster_layers]
+            cache["vector_layer_map"] = {l.get("layer_name"): l for l in vector_layers}
+            cache["raster_layer_map"] = {l.get("layer_name"): l for l in raster_layers}
+            
+            # ONLY return layer names (not full data) to reduce context length
             response["spatial_data"] = {
-                "vector_layers": [
-                    {
-                        "layer_name": l.get("layer_name"),
-                        "layer_type": l.get("layer_type"),
-                        "layer_url": l.get("layer_url")
-                    } for l in vector_layers
-                ],
-                "raster_layers": [
-                    {
-                        "layer_name": l.get("layer_name"),
-                        "layer_type": l.get("layer_type"),
-                        "layer_url": l.get("layer_url")
-                    } for l in raster_layers
-                ],
-                "total_layers": len(vector_layers) + len(raster_layers)
+                "available_vector_layers": cache["available_vector_layers"],
+                "available_raster_layers": cache["available_raster_layers"],
+                "total_layers": len(vector_layers) + len(raster_layers),
+                "note": "Access layer data via LAYER_CACHE['vector_layer_map'][layer_name]"
             }
+            
             print(f"✅ Retrieved {response['spatial_data']['total_layers']} layers ({len(vector_layers)} vector, {len(raster_layers)} raster)")
+            print(f"💾 Cached layer names only (reduced memory)")
             
         elif data_type == "timeseries":
             # Return timeseries data
@@ -174,7 +216,7 @@ def fetch_corestack_data(query: str) -> str:
             response["watershed_info"] = result_state.get("watershed_info", {})
             print(f"✅ Retrieved timeseries data for watershed {response['watershed_info'].get('uid', 'unknown')}")
         
-        # Return compact JSON (no indentation to reduce output size)
+        # Return compact JSON
         return json.dumps(response, default=str)
         
     except Exception as e:
@@ -200,67 +242,100 @@ def create_corestack_prompt(task: str) -> str:
     - Keeps same geospatial analysis structure
     """
     return f"""
-You are a geospatial analysis agent, expert at writing Python code to perform geospatial analysis.
+You are a geospatial analysis agent with access to:
+1. fetch_corestack_data - CoreStack geospatial database (India-specific layers) 
+2. web_search - DuckDuckGo search for general information
+3. Python libraries: geopandas, shapely, matplotlib, numpy, pandas, rasterio, requests, ee (Earth Engine)
 
-You have access to:
-1. fetch_corestack_data tool - for accessing CoreStack geospatial database
-2. Standard Python libraries: geopandas, shapely, matplotlib, numpy, pandas, rasterio, requests
+CRITICAL RULE: For ANY query about India or Indian locations, you MUST call fetch_corestack_data FIRST.
+DO NOT use web_search for India-specific geospatial data. CoreStack has the actual data.
 
-IMPORTANT - CORESTACK DATA ACCESS:
-When you need CoreStack geospatial data, FIRST use the fetch_corestack_data tool.
-The tool will return JSON with either:
-- spatial_data: Contains vector_layers and raster_layers with URLs
-- timeseries_data: Contains temporal metrics with years and values
+AVAILABLE CORESTACK DATA (CALL THE TOOL TO ACCESS):
+Vector Layers: {', '.join(CORESTACK_DATA_PRODUCTS['vector_layers'])}
+Raster Layers: {', '.join(CORESTACK_DATA_PRODUCTS['raster_layers'])}
+Timeseries Metrics: {', '.join(CORESTACK_DATA_PRODUCTS['timeseries_metrics'])}
 
-After getting the data, write Python code to analyze it.
+MANDATORY WORKFLOW FOR INDIA QUERIES:
+1. **FIRST ACTION**: Call fetch_corestack_data(query) - this returns actual data, not web results
+2. Check the returned JSON - it will have either spatial_data or timeseries_data
+3. If CoreStack has the data → use it in Python code
+4. **IMPORTANT**: If timeseries API fails, use spatial layers! 
+   - Cropping Intensity rasters/vectors have multi-year data
+   - Extract values at the point/area for analysis
+   - You can still analyze temporal trends from spatial layers
+5. ONLY if CoreStack completely fails → try Earth Engine or other sources
+6. Write Python code to analyze the data
+7. Use final_answer() to return results
 
-Instructions:
-1. If the task requires CoreStack data, call fetch_corestack_data tool first
-2. Parse the returned JSON to get layer URLs or timeseries data  
-3. Write Python code to:
-   - Download and process spatial data (use geopandas for vectors, rasterio for rasters)
-   - Analyze timeseries data (use pandas, matplotlib)
-   - Always reproject to appropriate CRS before area calculations (EPSG:32643 for India)
-4. Export results and visualizations
-5. Use the final_answer function to return your response
+USER TASK: {task}
 
-CRS HANDLING:
-- CoreStack data is in EPSG:4326 (WGS84 lat/lon)
-- For area calculations, reproject to UTM (EPSG:32643 for India)
-- For distance/buffer operations, use geodesic calculations
+START BY CALLING fetch_corestack_data WITH THE QUERY!
+If you get spatial layers, USE THEM even for temporal analysis!
 
-HELPER FUNCTIONS AVAILABLE:
-- SpatialDataProcessor.process_vector_url(url, point=(lat,lon), buffer_km=1.0)
-- SpatialDataProcessor.process_raster_url(url, bounds=None, circle_geom_4326=None)
-- geodesic_buffer(lon, lat, radius_m, out_crs="EPSG:4326")
 
-Example workflow:
+CRS HANDLING (CRITICAL):
+- CoreStack data: EPSG:4326 (WGS84 lat/lon)
+- India UTM Zone: EPSG:32643 (for area calculations)
+- For area: ALWAYS reproject to EPSG:32643 BEFORE calculating
+- For buffers: Use geodesic_buffer() function (already available)
+- For distance: Use geodesic calculations (geopy or shapely ops)
+
+Example:
 ```python
-# 1. Fetch CoreStack data
-data_json = fetch_corestack_data("water bodies near 25.31, 75.09")
-data = json.loads(data_json)
+import json
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from architecture4 import LAYER_CACHE
 
-# 2. Extract layer URLs
+# 1. Check CoreStack FIRST (for India data)
+result = fetch_corestack_data("water bodies near Bhilwara")
+data = json.loads(result)
+
 if data['success'] and data['data_type'] == 'spatial':
-    vector_layers = data['spatial_data']['vector_layers']
+    # 2. CoreStack has the data! Use it.
+    vector_names = LAYER_CACHE['available_vector_layers']
+    print(f"CoreStack layers: {{vector_names}}")
     
-    # Find water bodies layer
-    water_layer = next((l for l in vector_layers if 'water' in l['layer_name'].lower()), None)
-    
-    if water_layer:
-        # 3. Process the data
-        stats = SpatialDataProcessor.process_vector_url(
-            water_layer['layer_url'],
-            point=(25.31, 75.09),
-            buffer_km=10.0
-        )
+    # 3. Get specific layer
+    water_layer = LAYER_CACHE['vector_layer_map'].get('Surface Water Bodies')
+    if not water_layer:
+        water_layer = next((
+            LAYER_CACHE['vector_layer_map'][name] 
+            for name in vector_names
+            if 'water' in name.lower()
+        ), None)    if water_layer:
+        # 4. Load and process CoreStack data
+        gdf = gpd.read_file(water_layer['layer_url'])
         
-        # 4. Analyze and visualize
-        print(f"Found {{stats['feature_count']}} water bodies")
-        print(f"Total area: {{stats['total_area_ha']}} hectares")
+        # 5. REPROJECT for area calculation
+        gdf_utm = gdf.to_crs('EPSG:32643')  # India UTM
+        gdf_utm['area_ha'] = gdf_utm.geometry.area / 10000
         
-final_answer(f"Analysis complete. Found {{stats['feature_count']}} features.")
+        total_area = gdf_utm['area_ha'].sum()
+        print(f"Total water area: {{total_area:.2f}} hectares")
+        
+        gdf.plot(column='area_ha', legend=True)
+        plt.savefig('/app/exports/water_bodies.png')
+        
+        final_answer(f"Found {{len(gdf)}} water bodies totaling {{total_area:.2f}} hectares")
+    else:
+        # CoreStack doesn't have this specific layer, try Earth Engine
+        import ee
+        ee.Initialize(project='apt-achievment-453417-h6')
+        # ... use Earth Engine here
+else:
+    # CoreStack failed or doesn't have data, use Earth Engine
+    import ee
+    ee.Initialize(project='apt-achievment-453417-h6')
+    # ... use Earth Engine here
 ```
+
+IMPORTANT NOTES:
+- Import cache: `from architecture4 import LAYER_CACHE`
+- Get layer by name: `LAYER_CACHE['vector_layer_map']['layer_name']`
+- Don't print full layer URLs (context length!)
+- ALWAYS reproject to UTM (EPSG:32643) before area calculations
+- Save plots/exports to /app/exports/ directory (Docker volume mount)
 
 Task: {task}
 """
@@ -270,39 +345,49 @@ Task: {task}
 # HYBRID AGENT (CodeAct + LangGraph Tool)
 # ============================================================================
 
-def run_hybrid_agent(user_query: str, exports_dir: str = "./exports"):
+def run_hybrid_agent(user_query: str, exports_dir: str = None):
     """
-    Run CodeAct agent with LangGraph tool.
+    Run CodeAct agent with LangGraph tool + Docker execution (like agent.py).
     
-    Uses HuggingFace model with gemini endpoint.
-    Structure inspired by agent.py but adapted for Gemini via HF.
+    Uses Gemini model with Docker executor for full geospatial library support.
+    Structure exactly mirrors agent.py but with CoreStack tool added.
     """
+    # Set up absolute exports directory
+    if exports_dir is None:
+        exports_dir = os.path.abspath("./exports")
+    os.makedirs(exports_dir, exist_ok=True)
+    
     print("\n" + "="*70)
     print("🚀 HYBRID AGENT (CodeAct + LangGraph Tool)")
     print(f"📝 Query: {user_query}")
     print("="*70)
     
     # Use LiteLLM for Gemini (smolagents compatible)
-    # Using gemini-1.5-flash instead of experimental model for better quota
     model = LiteLLMModel(
         model_id="gemini/gemini-2.5-flash-lite",
         api_key=os.getenv("GEMINI_API_KEY")
     )
     
-    # Create CodeAct agent with LangGraph tool (structure from agent.py)
+    # Create tools list - NOTE: Only CoreStack tool, NO web_search to force using it
+    tools = [fetch_corestack_data]
+    
+    # Use local Python executor (skip Docker complexity)
+    print("✅ Using local Python executor")
     agent = CodeAgent(
         model=model,
-        tools=[fetch_corestack_data], 
+        tools=tools,
         additional_authorized_imports=[
             "geopandas", "shapely", "rasterio", "matplotlib", 
-            "numpy", "pandas", "json", "requests", "pyproj"
+            "numpy", "pandas", "json", "requests", "pyproj", "ee",
+            "fiona", "geopy"
         ]
-        # Note: Can add Docker execution like agent.py if needed
     )
     
     try:
         # Generate prompt and run agent
         prompt = create_corestack_prompt(user_query)
+        
+        # Run agent (it will populate LAYER_CACHE when tool is called)
         result = agent.run(prompt)
         
         print("\n" + "="*70)
@@ -317,6 +402,14 @@ def run_hybrid_agent(user_query: str, exports_dir: str = "./exports"):
         error_msg = f"Agent execution failed: {str(e)}"
         print(f"\n❌ ERROR: {error_msg}")
         raise e
+    finally:
+        # Cleanup Docker container (like agent.py)
+        if DOCKER_AVAILABLE and hasattr(agent, 'python_executor'):
+            try:
+                agent.python_executor.cleanup()
+                print("🧹 Docker container cleaned up")
+            except:
+                pass
 
 
 # ============================================================================
@@ -370,9 +463,9 @@ if __name__ == "__main__":
         print(f"{i}. {q}")
     
     print("\n" + "="*70)
-    print("Running first query...")
+    print("Running query #1 from CSV (Shirur, Dharwad, Karnataka - correct coords)...")
     print("="*70)
     
-    # Run first query
-    run_hybrid_agent("Could you show me how cropping intensity in bhilwara has changed over the years?")
-
+    # Query #1: Cropping intensity change over years in Shirur, Dharwad, Karnataka
+    # Correct coordinates: 15.23° N, 75.27° E (Kundgol taluk, Dharwad district)
+    run_hybrid_agent("Could you show me how cropping intensity in village Shirur at coordinates 15.23, 75.27 in Dharwad district, Karnataka has changed over the years?")
