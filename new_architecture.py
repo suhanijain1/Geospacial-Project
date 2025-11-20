@@ -770,11 +770,11 @@ NOW GENERATE CODE (Python only, no markdown):"""
 
 def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    FIXED: Parse user query with proper data product classification.
-    Maps queries to actual CoreStack layers.
+    Simplified intent parser: Extract ONLY location and temporal info.
+    Layer selection is handled by Architecture 4's CodeAct.
     """
     print("\n" + "="*70)
-    print("🧠 PARSING INTENT")
+    print("🧠 PARSING INTENT (Location & Temporal)")
     print("="*70)
     
     user_query = state["user_query"]
@@ -785,186 +785,11 @@ def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
         google_api_key=GEMINI_API_KEY
     )
     
-    prompt = f"""Extract structured information from this geospatial query and map to the CORRECT CoreStack data product.
+    prompt = f"""Extract location and temporal information from this geospatial query.
 
 USER QUERY: "{user_query}"
 
-═══════════════════════════════════════════════════════════════════════════════
-CRITICAL UNDERSTANDING: SPATIAL vs TIMESERIES DATA PRODUCTS
-═══════════════════════════════════════════════════════════════════════════════
-
-CoreStack has TWO FUNDAMENTALLY DIFFERENT data structures:
-
-1️⃣ SPATIAL DATA (Vectors/Rasters):
-   - Geographic features with SPATIAL VARIATION across a region
-   - Data varies BY LOCATION (different patches/polygons have different values)
-   - Temporal data stored as YEARLY ATTRIBUTE COLUMNS, not timeseries arrays
-   - Example: cropping_intensity_vector has columns: cropping_intensity_2017, cropping_intensity_2018, ..., cropping_intensity_2023
-   - Use for: Village/tehsil-level analysis where spatial variation matters
-
-2️⃣ TIMESERIES DATA (Watershed MWS):
-   - Single aggregated value per watershed per time period
-   - NO spatial variation (entire watershed = 1 value)
-   - Fortnightly measurements (water balance components)
-   - Example: water_balance timeseries has arrays: year[], fortnight[], runoff[], precipitation[]
-   - Use for: Watershed water budget analysis only
-
-═══════════════════════════════════════════════════════════════════════════════
-DECISION FRAMEWORK WITH EXPLANATIONS
-═══════════════════════════════════════════════════════════════════════════════
-
-Query 1: "Cropping Intensity in [Village] Over Years"
-───────────────────────────────────────────────────────
-✅ CORRECT: cropping_intensity_vector (spatial_vector)
-❌ WRONG: watershed timeseries
-
-WHY SPATIAL?
-- Cropping intensity is SPATIALLY VARIABLE (different fields have different intensity)
-- You want: total area under crops in village, which varies by location
-- Data structure: GeoDataFrame with polygon features
-- Temporal aspect: Stored as yearly columns (cropping_intensity_2017, 2018, ..., 2023)
-- Analysis: Sum/average these columns across village polygons
-
-WHY NOT TIMESERIES?
-- Watershed timeseries measures aggregate WATER BALANCE (runoff, precip, ET)
-- It's NOT about cropping patterns or land use
-- Timeseries is fortnightly, not yearly
-- Timeseries has NO spatial variation (1 value per watershed)
-
-RECOMMENDED LAYER: "Cropping Intensity" (exact name from CoreStack)
-DATA TYPE: spatial_vector
-ANALYSIS TYPE: temporal_vector (yearly columns)
-
-───────────────────────────────────────────────────────
-
-Query 2: "Surface Water Availability Over Years in [Village]"
-───────────────────────────────────────────────────────
-✅ PRIMARY: surface_water_bodies_vector (spatial_vector)
-⚠️  OPTIONAL CONTEXT: water_balance (timeseries) for watershed-level trends
-
-WHY SPATIAL?
-- Surface water bodies are PHYSICAL FEATURES with geometry (lakes, ponds, reservoirs)
-- You want: total area of water bodies within village boundaries
-- Data structure: Polygon features with seasonal attributes (Kharif/Rabi/Zaid flags)
-- Analysis: Clip polygons to village, sum area per season
-
-WHY NOT JUST TIMESERIES?
-- Watershed water_balance is AGGREGATE (entire watershed, not village-level)
-- Water balance doesn't tell you WHERE water bodies are located
-- You need spatial polygons to answer "how much water in THIS village"
-
-CRITICAL CAVEAT:
-- surface_water_bodies_vector may be a SINGLE SNAPSHOT per year (from LULC conversion)
-- For multi-year TRENDS, you may need to derive from land_use_land_cover_raster
-- Workaround: Count water pixels (classes 2-4) in LULC for years 2017-2024
-
-RECOMMENDED LAYER: "Surface Water Bodies" (exact name from CoreStack)
-DATA TYPE: spatial_vector (primary) + optional timeseries context
-ANALYSIS TYPE: temporal_vector (if multi-year versions exist) OR spatial_summary (single snapshot)
-
-───────────────────────────────────────────────────────
-
-Query 3: "Tree Cover Loss in [Village] Since [Year]"
-───────────────────────────────────────────────────────
-✅ CORRECT: change_tree_cover_loss_raster (change_raster)
-
-WHY CHANGE RASTER?
-- Pre-computed transition matrix: trees (class 6) → other classes
-- Period: 2017-2022 composite (mode of 2017-2019 vs 2020-2022)
-- Classes: Trees→Built-up, Trees→Barren, Trees→Crops, Trees→Shrubs
-- Analysis: Mask to loss classes, count pixels, convert to hectares
-
-WHY NOT LULC YEARLY RASTERS?
-- Change rasters are PRE-COMPUTED and optimized for this exact query
-- Saves computation (no need to manually compare 2017 vs 2022 LULC)
-- Already has transition classes ready to filter
-
-FALLBACK: If custom time period (e.g., "2018-2024"):
-- Use land_use_land_cover_raster for specific years
-- Compare class 6 (trees) presence across years manually
-
-RECOMMENDED LAYER: "Change Tree Cover Loss" (exact name from CoreStack)
-DATA TYPE: change_raster
-ANALYSIS TYPE: change_detection
-
-───────────────────────────────────────────────────────
-
-Query 4: "Cropland to Built-up Conversion in [Village] Since [Year]"
-───────────────────────────────────────────────────────
-✅ CORRECT: change_urbanization_raster (change_raster)
-
-WHY CHANGE RASTER?
-- Pre-computed transition: Crops/Trees → Built-up (class 3 in urbanization raster)
-- Period: 2017-2022 composite
-- Analysis: Filter to class 3, count pixels, convert to hectares
-
-CRITICAL: Class 3 specifically = "Trees/Crops → Built-up"
-- Other classes in this raster: Built-up expansion, Barren→Built-up
-- Must filter correctly to answer "cropland to built-up" query
-
-RECOMMENDED LAYER: "Change Urbanization" (exact name from CoreStack)
-DATA TYPE: change_raster
-ANALYSIS TYPE: change_detection
-
-───────────────────────────────────────────────────────
-
-Query 5: "Drought-Affected Tehsils in [State]"
-───────────────────────────────────────────────────────
-✅ CORRECT: drought_frequency_vector (spatial_vector)
-
-WHY SPATIAL?
-- Drought frequency is SPATIALLY VARIABLE (different MWS/villages have different severity)
-- Data structure: Polygon features with drought severity attributes
-- Categories: Severe/Moderate/Mild drought weeks
-- Analysis: Aggregate to tehsil level, filter by severity threshold
-
-DEFINITION: Drought = #moderate weeks + #severe weeks >= 5
-
-WHY NOT TIMESERIES?
-- Timeseries water_balance has precipitation/runoff but NOT drought classification
-- You'd need to compute drought index yourself from timeseries
-- Drought frequency vector is PRE-COMPUTED spatial layer
-
-RECOMMENDED LAYER: "Drought Frequency" OR "Drought Causality" (exact name from CoreStack)
-DATA TYPE: spatial_vector
-ANALYSIS TYPE: state_aggregation (aggregate MWS/villages to tehsil)
-
-═══════════════════════════════════════════════════════════════════════════════
-AVAILABLE CORESTACK LAYERS (EXACT NAMES - CASE SENSITIVE)
-═══════════════════════════════════════════════════════════════════════════════
-
-SPATIAL VECTORS:
-- "Cropping Intensity" (yearly columns: cropping_intensity_2017, ..., 2023)
-- "Surface Water Bodies" (seasonal flags: Kharif/Rabi/Zaid)
-- "Drought Frequency" (severity: Severe/Moderate/Mild)
-- "Drought Causality" (alternative drought layer)
-- "NREGA" (rural employment scheme assets)
-- "LULC" (vectorized land use polygons)
-- "Aquifer" (groundwater aquifer boundaries)
-- "Terrain Clusters" (elevation/slope groupings)
-- "SOGE" (state of groundwater estimation)
-- "Change Vector Degradation" (land degradation polygons)
-
-CHANGE RASTERS (2017-2022 composites):
-- "Change Tree Cover Loss" (trees → other classes)
-- "Change Tree Cover Gain" (other → trees)
-- "Change Urbanization" (any class → built-up)
-- "Change Cropping Reduction" (crops → other classes)
-- "Change Cropping Intensity" (intensity increase/decrease)
-
-LAND USE RASTERS (yearly, 10m resolution):
-- "LULC_level_1" (12 classes: Built-up, Water, Trees, Crops, etc.)
-- "LULC_level_2" (detailed classes)
-- "Tree Canopy Density High" (yearly)
-- "Tree Canopy Density Low" (yearly)
-
-TIMESERIES (Watershed MWS only):
-- water_balance (fortnightly: precipitation, runoff, ET, soil moisture)
-- NOT for spatial queries or village-level analysis
-
-═══════════════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════════════════════════
+TASK: Extract structured location and time information ONLY.
 
 Return JSON:
 {{
@@ -973,24 +798,48 @@ Return JSON:
   "location_name": <string or null>,
   "location_type": "village" | "tehsil" | "state" | "coordinates",
   "district": <string or null>,
-  "metric": <string describing what user wants to measure>,
   "temporal": <bool - true if query asks about trends/changes over time>,
   "start_year": <int or null>,
-  "end_year": <int or null>,
-  "data_type_needed": "spatial_vector" | "change_raster" | "timeseries" | "land_use_raster",
-  "analysis_type": "temporal_vector" | "change_detection" | "state_aggregation" | "spatial_summary",
-  "recommended_layer": <exact layer name from list above>,
-  "notes": <string explaining caveats, e.g., "Single snapshot, use LULC for multi-year trends" or "Pre-computed 2017-2022 only, use LULC for custom periods">
+  "end_year": <int or null>
 }}
 
-DECISION RULES:
-1. If query mentions "over years" + spatial metric (cropping, water bodies) → spatial_vector (NOT timeseries)
-2. If query mentions "change"/"loss"/"gain" + 2017-2022 period → change_raster
-3. If query mentions custom time period (2018-2024) or non-standard years → land_use_raster + notes
-4. If query is about watershed water budget → timeseries
-5. If query is about state-level aggregation → spatial_vector + state_aggregation
-6. ALWAYS use exact layer names from the list above (case-sensitive)
-7. Add caveats in notes if data limitations exist (single snapshot, composite period, etc.)
+EXAMPLES:
+
+Query: "Cropping intensity in Shirur village over years"
+{{
+  "latitude": null,
+  "longitude": null,
+  "location_name": "Shirur",
+  "location_type": "village",
+  "district": null,
+  "temporal": true,
+  "start_year": null,
+  "end_year": null
+}}
+
+Query: "Tree cover loss in Bangalore since 2018"
+{{
+  "latitude": null,
+  "longitude": null,
+  "location_name": "Bangalore",
+  "location_type": "tehsil",
+  "district": null,
+  "temporal": true,
+  "start_year": 2018,
+  "end_year": null
+}}
+
+Query: "Surface water at coordinates 15.123, 76.456"
+{{
+  "latitude": 15.123,
+  "longitude": 76.456,
+  "location_name": null,
+  "location_type": "coordinates",
+  "district": null,
+  "temporal": false,
+  "start_year": null,
+  "end_year": null
+}}
 
 NOW PARSE THE QUERY:"""
 
@@ -1007,32 +856,14 @@ NOW PARSE THE QUERY:"""
                 parsed['latitude'], parsed['longitude'] = coords
                 print(f"🌍 Geocoded '{parsed['location_name']}' → ({coords[0]:.5f}, {coords[1]:.5f})")
         
-        # Map recommended_layer to exact CoreStack layer names (if abbreviated)
-        layer_name_mapping = {
-            "cropping_intensity_vector": "Cropping Intensity",
-            "surface_water_bodies_vector": "Surface Water Bodies",
-            "change_tree_cover_loss_raster": "Change Tree Cover Loss",
-            "change_urbanization_raster": "Change Urbanization",
-            "drought_frequency_vector": "Drought Frequency",
-            "change_cropping_reduction_raster": "Change Cropping Reduction",
-            "change_tree_cover_gain_raster": "Change Tree Cover Gain",
-            "land_use_land_cover_raster": "LULC_level_1",
-            "lulc_vector": "LULC"
-        }
-        
-        # Normalize layer name to exact CoreStack format
-        recommended = parsed.get('recommended_layer', '')
-        if recommended in layer_name_mapping:
-            parsed['recommended_layer'] = layer_name_mapping[recommended]
-        
         state["parsed"] = parsed
         
         print(f"\n✅ PARSED INTENT:")
-        print(f"   Data Type: {parsed.get('data_type_needed')}")
-        print(f"   Analysis Type: {parsed.get('analysis_type')}")
-        print(f"   Layer: {parsed.get('recommended_layer')}")
         location_display = parsed.get('location_name') or f"({parsed.get('latitude')}, {parsed.get('longitude')})"
-        print(f"   Location: {location_display}")
+        print(f"   Location: {location_display} ({parsed.get('location_type')})")
+        print(f"   Temporal: {parsed.get('temporal')}")
+        if parsed.get('start_year') or parsed.get('end_year'):
+            print(f"   Time Range: {parsed.get('start_year')} - {parsed.get('end_year')}")
         
     except Exception as e:
         state["error"] = f"Intent parsing failed: {str(e)}"
@@ -1043,30 +874,28 @@ NOW PARSE THE QUERY:"""
 
 def fetch_spatial_layers_multiregion(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fetch spatial layers from ALL intersecting regions.
-    Accumulates URLs from multiple tehsils if village spans them.
+    Fetch ALL spatial layers from intersecting regions.
+    Returns complete layer list for Architecture 4 CodeAct to choose from.
     """
     
     if "error" in state:
         return state
     
     print("\n" + "="*70)
-    print("📥 FETCHING SPATIAL LAYERS (MULTI-REGION)")
+    print("📥 FETCHING ALL SPATIAL LAYERS (MULTI-REGION)")
     print("="*70)
     
     parsed = state["parsed"]
     resolved = state.get("resolved_geometry", {})
     tehsil_list = resolved.get("tehsil_list", [])
-    recommended_layer = parsed.get("recommended_layer", "")
     
     if not tehsil_list:
         state["error"] = "No tehsils resolved"
         return state
     
     print(f"\n🔄 Fetching from {len(tehsil_list)} regions...")
-    print(f"   Target layer: {recommended_layer}")
     
-    data_urls = {'vector': [], 'raster': []}
+    all_layers = {'vector': {}, 'raster': {}}  # Use dict to deduplicate by layer_name
     location_info = {}
     
     for tehsil_info in tehsil_list:
@@ -1095,44 +924,64 @@ def fetch_spatial_layers_multiregion(state: Dict[str, Any]) -> Dict[str, Any]:
             
             location_info = admin_info  # Store last location info
             
-            # Filter to recommended layer
-            found_count = 0
+            # Collect ALL layers (group by layer_name)
             for layer in layers:
-                if layer['layer_name'] == recommended_layer:
-                    layer_info = {
+                layer_name = layer['layer_name']
+                layer_type = layer.get('layer_type', 'vector')
+                
+                # Initialize layer entry if first time seeing this layer
+                if layer_type == 'vector':
+                    if layer_name not in all_layers['vector']:
+                        all_layers['vector'][layer_name] = {
+                            'layer_name': layer_name,
+                            'layer_type': 'vector',
+                            'urls': []
+                        }
+                    all_layers['vector'][layer_name]['urls'].append({
                         'tehsil': tehsil_name,
                         'district': district_name,
                         'state': state_name,
-                        'layer_name': layer['layer_name'],
-                        'url': layer['layer_url'],
-                        'type': layer.get('layer_type', 'vector')
-                    }
-                    
-                    if layer.get('layer_type') == 'vector':
-                        data_urls['vector'].append(layer_info)
-                    elif layer.get('layer_type') == 'raster':
-                        data_urls['raster'].append(layer_info)
-                    
-                    found_count += 1
-                    print(f"      ✅ Found: {layer['layer_name']}")
+                        'url': layer['layer_url']
+                    })
+                elif layer_type == 'raster':
+                    if layer_name not in all_layers['raster']:
+                        all_layers['raster'][layer_name] = {
+                            'layer_name': layer_name,
+                            'layer_type': 'raster',
+                            'urls': []
+                        }
+                    all_layers['raster'][layer_name]['urls'].append({
+                        'tehsil': tehsil_name,
+                        'district': district_name,
+                        'state': state_name,
+                        'url': layer['layer_url']
+                    })
             
-            if found_count == 0:
-                print(f"      ⚠️  Layer '{recommended_layer}' not found in this tehsil")
+            print(f"      ✅ Collected {len(layers)} layers")
         
         except Exception as e:
             print(f"      ⚠️  Error fetching from {tehsil_name}: {str(e)}")
             continue
     
-    print(f"\n✅ FETCHING COMPLETE:")
-    print(f"   Vector layers: {len(data_urls['vector'])}")
-    print(f"   Raster layers: {len(data_urls['raster'])}")
+    # Convert dict to list format
+    vector_layers = list(all_layers['vector'].values())
+    raster_layers = list(all_layers['raster'].values())
     
-    if len(data_urls['vector']) == 0 and len(data_urls['raster']) == 0:
-        state["error"] = f"Layer '{recommended_layer}' not found in any region"
+    print(f"\n✅ FETCHING COMPLETE:")
+    print(f"   Unique vector layers: {len(vector_layers)}")
+    print(f"   Unique raster layers: {len(raster_layers)}")
+    print(f"\n📋 Available layers:")
+    for layer in vector_layers[:10]:  # Show first 10
+        print(f"   • {layer['layer_name']} (vector, {len(layer['urls'])} regions)")
+    for layer in raster_layers[:10]:
+        print(f"   • {layer['layer_name']} (raster, {len(layer['urls'])} regions)")
+    
+    if len(vector_layers) == 0 and len(raster_layers) == 0:
+        state["error"] = "No layers found in any region"
         print(f"❌ ERROR: {state['error']}")
         return state
     
-    state["data_urls"] = data_urls
+    state["available_layers"] = {'vector': vector_layers, 'raster': raster_layers}
     state["location_info"] = location_info
     
     return state

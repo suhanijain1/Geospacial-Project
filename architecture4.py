@@ -78,8 +78,18 @@ CORESTACK_DATA_PRODUCTS = {
 @tool
 def fetch_corestack_data(query: str) -> str:
     """
-    FIXED: Fetches and merges geospatial data using improved LangGraph workflow.
-    Returns clean, clipped data ready for CodeAct analysis.
+    Fetches available CoreStack layers for a location from LangGraph workflow.
+    Returns list of available layers with URLs for CodeAct to choose and analyze.
+    
+    Args:
+        query: Natural language query with location (e.g., "Shirur village cropping intensity")
+    
+    Returns:
+        JSON string with:
+        - success: bool
+        - spatial_data: dict with vector_layers[] and raster_layers[]
+        - Each layer has: layer_name, layer_type, urls[] (multi-region support)
+        - location_info: administrative details
     """
     import json
     import sys
@@ -93,7 +103,7 @@ def fetch_corestack_data(query: str) -> str:
     from new_architecture import build_graph
     
     print("\n" + "="*70)
-    print("📊 CORESTACK DATA FETCHER (via LangGraph)")
+    print("📊 CORESTACK LAYER FETCHER (via LangGraph)")
     print(f"   Query: {query}")
     print("="*70)
     
@@ -113,47 +123,33 @@ def fetch_corestack_data(query: str) -> str:
                 "error": result_state["error"]
             }, indent=2)
         
-        # Extract results
-        merged_data_type = result_state.get("merged_data_type")
+        # Extract available layers
+        available_layers = result_state.get("available_layers", {})
+        location_info = result_state.get("location_info", {})
+        parsed = result_state.get("parsed", {})
         
-        if merged_data_type == "vector":
-            # Return vector data info
-            merged_gdf = result_state.get("merged_data")
-            
-            response = {
-                "success": True,
-                "data_type": "vector",
-                "feature_count": len(merged_gdf),
-                "columns": list(merged_gdf.columns),
-                "sample_features": merged_gdf.head(3).to_dict(),
-                "geojson_path": result_state.get("merged_data_path"),
-                "bounds": str(merged_gdf.total_bounds)
+        # Return layer catalog for CodeAct to choose from
+        response = {
+            "success": True,
+            "data_type": "spatial",
+            "spatial_data": {
+                "vector_layers": available_layers.get('vector', []),
+                "raster_layers": available_layers.get('raster', [])
+            },
+            "location_info": location_info,
+            "parsed_query": {
+                "location_name": parsed.get('location_name'),
+                "latitude": parsed.get('latitude'),
+                "longitude": parsed.get('longitude'),
+                "temporal": parsed.get('temporal'),
+                "start_year": parsed.get('start_year'),
+                "end_year": parsed.get('end_year')
             }
-            
-        elif merged_data_type == "raster":
-            # Return raster data info
-            import rasterio
-            
-            raster_path = result_state.get("merged_data_path")
-            with rasterio.open(raster_path) as src:
-                response = {
-                    "success": True,
-                    "data_type": "raster",
-                    "shape": (src.height, src.width),
-                    "crs": str(src.crs),
-                    "bounds": src.bounds,
-                    "raster_path": raster_path,
-                    "dtype": str(src.dtypes[0]),
-                    "nodata": src.nodata
-                }
-            
-        else:
-            response = {
-                "success": True,
-                "message": "Data fetched but no merged data available"
-            }
+        }
         
-        print(f"\n✅ FETCH COMPLETE: {response}")
+        print(f"\n✅ FETCH COMPLETE:")
+        print(f"   Vector layers: {len(available_layers.get('vector', []))}")
+        print(f"   Raster layers: {len(available_layers.get('raster', []))}")
         return json.dumps(response, default=str)
         
     except Exception as e:
@@ -188,6 +184,86 @@ osmnx, geopandas, shapely, matplotlib, numpy, pandas, rasterio, ee, geemap, geed
 You will be given a task, you will write python code to perform the task and export outputs to local machine.
 
 If your code has errors, you will search for tutorials and documentations of earlier mentioned libraries to fix the errors.
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL UNDERSTANDING: SPATIAL vs TIMESERIES DATA (CoreStack Architecture)
+═══════════════════════════════════════════════════════════════════════════════
+
+CoreStack has TWO FUNDAMENTALLY DIFFERENT data structures you MUST understand:
+
+**1️⃣ SPATIAL DATA (Vectors/Rasters)** - For location-specific analysis:
+   - Geographic features with SPATIAL VARIATION across a region
+   - Data varies BY LOCATION (different patches/polygons have different values)
+   - Temporal data stored as YEARLY ATTRIBUTE COLUMNS, NOT timeseries arrays
+   - Example: cropping_intensity_vector has columns: cropping_intensity_2017, cropping_intensity_2018, ..., cropping_intensity_2023
+   - Use for: Village/tehsil-level analysis where spatial variation matters
+
+**2️⃣ TIMESERIES DATA (Watershed MWS)** - For temporal water budget analysis:
+   - Single aggregated value per watershed per time period
+   - NO spatial variation (entire watershed = 1 value)
+   - Fortnightly measurements (water balance components)
+   - Example: water_balance timeseries has arrays: year[], fortnight[], runoff[], precipitation[]
+   - Use for: Watershed water budget analysis ONLY
+
+═══════════════════════════════════════════════════════════════════════════════
+LAYER SELECTION DECISION FRAMEWORK (WITH EXPLANATIONS)
+═══════════════════════════════════════════════════════════════════════════════
+
+**Query Type 1: "Cropping Intensity in [Village] Over Years"**
+✅ CORRECT CHOICE: cropping_intensity_vector (spatial vector)
+❌ WRONG CHOICE: watershed timeseries
+
+WHY SPATIAL?
+- Cropping intensity is SPATIALLY VARIABLE (different fields = different intensity)
+- You want: total area under crops in village, which varies by location
+- Data structure: GeoDataFrame with polygon features
+- Temporal aspect: Stored as yearly columns (cropping_intensity_2017, 2018, ..., 2023)
+- Analysis approach: Sum/average these columns across village polygons, plot trend
+
+WHY NOT TIMESERIES?
+- Watershed timeseries measures aggregate WATER BALANCE (runoff, precip, ET)
+- It's NOT about cropping patterns or land use
+- Timeseries is fortnightly, not yearly
+- Timeseries has NO spatial variation (1 value per watershed)
+
+**Query Type 2: "Surface Water Availability Over Years in [Village]"**
+✅ PRIMARY: surface_water_bodies_vector (spatial vector)
+⚠️  OPTIONAL CONTEXT: water_balance (timeseries) for watershed-level trends
+
+WHY SPATIAL?
+- Surface water bodies are PHYSICAL FEATURES with geometry (lakes, ponds, reservoirs)
+- You want: total area of water bodies within village boundaries
+- Data structure: Polygon features with seasonal attributes (Kharif/Rabi/Zaid flags)
+- Analysis: Clip polygons to village, sum area per season
+
+CAVEAT: surface_water_bodies_vector may be a SINGLE SNAPSHOT per year
+- For multi-year TRENDS, derive from land_use_land_cover_raster
+- Workaround: Count water pixels (classes 2-4) in LULC for years 2017-2024
+
+**Query Type 3: "Tree Cover Loss in [Village] Since [Year]"**
+✅ CORRECT: change_tree_cover_loss_raster (change raster)
+
+WHY CHANGE RASTER?
+- Pre-computed transition matrix: trees (class 6) → other classes
+- Period: 2017-2022 composite (mode of 2017-2019 vs 2020-2022)
+- Classes: Trees→Built-up, Trees→Barren, Trees→Crops, Trees→Shrubs
+- Analysis: Mask to loss classes, count pixels, convert to hectares
+- SAVES COMPUTATION vs manually comparing 2017 vs 2022 LULC
+
+FALLBACK: If custom time period (e.g., "2018-2024"):
+- Use land_use_land_cover_raster for specific years
+- Compare class 6 (trees) presence across years manually
+
+**Query Type 4: "Cropland to Built-up Conversion in [Village]"**
+✅ CORRECT: change_urbanization_raster (change raster)
+
+WHY?
+- Pre-computed transition: Crops/Trees → Built-up
+- Class 3 specifically = "Crops → Built-up" (THIS IS WHAT YOU WANT!)
+- Period: 2017-2022 composite
+- Analysis: Filter to class 3, count pixels, convert to hectares
+
+═══════════════════════════════════════════════════════════════════════════════
 
 Instructions:
 1. **CORESTACK PRIORITY (PRIMARY)**: For ANY query about India or Indian locations, you MUST call fetch_corestack_data FIRST to access CoreStack database. Available CoreStack layers:
@@ -243,14 +319,17 @@ CoreStack data is provided at **microwatershed (MWS) level**, NOT village level.
 3. For village-level analysis: Aggregate statistics across all microwatersheds (use mean, sum, etc.)
 4. Use `uid` column for microwatershed identification
 
-**MULTI-REGION DATA MERGING** (when layer has merge_required=True):
-When village spans multiple tehsils, some layers will have a 'merge_required' flag and 'merge_sources' list.
-Check layer.get('merge_required') and if True, read all URLs from layer['merge_sources'], then concat the GeoDataFrames.
+**MULTI-REGION DATA SUPPORT**:
+When village spans multiple tehsils, layers will have MULTIPLE URLs in the 'urls' array.
+Each layer has structure: {{'layer_name': str, 'layer_type': str, 'urls': [{{url, tehsil, district, state}}, ...]}}
+For multi-region layers: Read ALL URLs, concat GeoDataFrames, then analyze.
 
 2. **CORESTACK USAGE** (for India queries):
     ```python
     import json
     import os
+    import geopandas as gpd
+    import pandas as pd
     
     # ALWAYS create exports directory first
     os.makedirs('./exports', exist_ok=True)
@@ -263,11 +342,53 @@ Check layer.get('merge_required') and if True, read all URLs from layer['merge_s
         vector_layers = data['spatial_data']['vector_layers']
         raster_layers = data['spatial_data']['raster_layers']
         
-        # CHANGE DETECTION EXAMPLE: Tree cover loss
+        # EXAMPLE 1: TEMPORAL VECTOR (Cropping Intensity Over Years)
+        for layer in vector_layers:
+            if 'Cropping Intensity' in layer['layer_name']:
+                # Handle multi-region: Read all URLs and concat
+                all_gdfs = []
+                for url_info in layer['urls']:
+                    gdf = gpd.read_file(url_info['url'])
+                    all_gdfs.append(gdf)
+                
+                # Merge all regions
+                merged_gdf = pd.concat(all_gdfs, ignore_index=True)
+                
+                # CRITICAL: Extract years from column names (e.g., 'cropping_intensity_2017')
+                import re
+                year_cols = [col for col in merged_gdf.columns if 'cropping_intensity_' in col and re.search(r'\\d{{4}}', col)]
+                
+                # Parse year from column name: 'cropping_intensity_2017' -> 2017
+                years_data = []
+                for col in sorted(year_cols):
+                    year_match = re.search(r'(\\d{{4}})', col)
+                    if year_match:
+                        year = int(year_match.group(1))
+                        avg_value = merged_gdf[col].mean()
+                        years_data.append((year, avg_value))
+                
+                # Sort by year and plot
+                years_data.sort()
+                years_list = [y[0] for y in years_data]
+                values_list = [y[1] for y in years_data]
+                
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(10, 6))
+                plt.plot(years_list, values_list, marker='o')
+                plt.xlabel('Year')
+                plt.ylabel('Average Cropping Intensity')
+                plt.title('Cropping Intensity Over Years')
+                plt.savefig('./exports/cropping_intensity_over_years.png')
+                print(f"Years: {{years_list}}")
+                print(f"Values: {{values_list}}")
+        
+        # EXAMPLE 2: CHANGE DETECTION RASTER (Tree Cover Loss)
         for layer in raster_layers:
-            if 'change_tree_cover_loss' in layer['layer_name']:
+            if 'Change Tree Cover Loss' in layer['layer_name']:
                 import rasterio
-                with rasterio.open(layer['layer_url']) as src:
+                # For rasters, typically use first URL (single region or mosaic)
+                url = layer['urls'][0]['url']
+                with rasterio.open(url) as src:
                     loss_data = src.read(1)
                     # Mask to class 1 (loss areas)
                     loss_mask = (loss_data == 1)
@@ -276,38 +397,6 @@ Check layer.get('merge_required') and if True, read all URLs from layer['merge_s
                     pixel_area = src.transform[0] * abs(src.transform[4])
                     loss_area_ha = loss_area_pixels * pixel_area / 10000
                     print(f"Tree cover loss: {{loss_area_ha:.2f}} hectares")
-        
-        # TEMPORAL VECTOR EXAMPLE: Cropping intensity over years
-        for layer in vector_layers:
-            if 'cropping_intensity' in layer['layer_name']:
-                gdf = gpd.read_file(layer['layer_url'])
-                
-                # IMPORTANT: Extract years from column names (e.g., 'cropping_intensity_2017')
-                import re
-                year_cols = [col for col in gdf.columns if 'cropping_intensity_' in col and re.search(r'\d{4}', col)]
-                
-                # Parse year from column name: 'cropping_intensity_2017' -> 2017
-                years_data = []
-                for col in sorted(year_cols):
-                    year_match = re.search(r'(\d{4})', col)
-                    if year_match:
-                        year = int(year_match.group(1))
-                        avg_value = gdf[col].mean()
-                        years_data.append((year, avg_value))
-                
-                # Sort by year and plot
-                years_data.sort()
-                years = [y[0] for y in years_data]
-                values = [y[1] for y in years_data]
-                
-                plt.figure(figsize=(10, 6))
-                plt.plot(years, values, marker='o')
-                plt.xlabel('Year')
-                plt.ylabel('Average Cropping Intensity')
-                plt.title('Cropping Intensity Over Years')
-                plt.savefig('./exports/cropping_intensity_over_years.png')
-                print(f"Years: {years}")
-                print(f"Values: {values}")
                 
     elif data['success'] and data['data_type'] == 'timeseries':
         # Access timeseries data
