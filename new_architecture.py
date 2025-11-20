@@ -1,78 +1,6 @@
 """
 New Clean Architecture for Geospatial Agent
-Merges LangGraph orchestration with CodeAct execution
-Uses Gemini for planning and code generation with clear API tracking
 
-================================================================================
-CORESTACK API DOCUMENTATION (from Swagger)
-================================================================================
-
-Base URL: https://geoserver.core-stack.org/api/v1/
-Authentication: X-API-Key header
-
-API ENDPOINTS & WORKFLOWS:
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│ WORKFLOW 1: SPATIAL LAYER ACCESS (for spatial analysis queries)        │
-└─────────────────────────────────────────────────────────────────────────┘
-
-Step 1: GET /get_admin_details_by_latlon/
-   Input:  latitude (float), longitude (float)
-   Output: {"State": str, "District": str, "Tehsil": str}
-   Use:    Get administrative boundaries from coordinates
-   
-Step 2: GET /get_generated_layer_urls/
-   Input:  state (str), district (str), tehsil (str)
-   Output: List of layer objects with:
-           - layer_name: str (e.g., "SOGE", "Drainage", "NDVI")
-           - layer_url: str (GeoJSON or GeoTIFF URL)
-           - layer_type: str ("vector" or "raster")
-   Use:    Get all available spatial layers for the location
-   
-COUPLING: Must call get_admin_details_by_latlon BEFORE get_generated_layer_urls
-USE CASE: "Show water bodies near X", "What's the land use around Y"
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│ WORKFLOW 2: WATERSHED TIMESERIES DATA (for temporal analysis queries)  │
-└─────────────────────────────────────────────────────────────────────────┘
-
-Step 1: GET /get_mwsid_by_latlon/
-   Input:  latitude (float), longitude (float)
-   Output: {"uid": str, "state": str, "district": str, "tehsil": str}
-   Use:    Get watershed unique identifier from coordinates
-   Note:   Only for timeseries! NOT for spatial layers!
-   
-Step 2: GET /get_mws_data/
-   Input:  uid (str)
-   Output: Timeseries data object with year/value/source arrays
-   Use:    Get temporal metrics (precipitation, groundwater, etc.)
-   
-COUPLING: Must call get_mwsid_by_latlon BEFORE get_mws_data
-USE CASE: "How did X change from 2017 to 2023", "Show precipitation trends"
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│ IMPORTANT: These are SEPARATE, INDEPENDENT workflows!                  │
-│                                                                         │
-│ ✅ For spatial analysis → Use Workflow 1 (admin details → layers)      │
-│ ✅ For timeseries → Use Workflow 2 (watershed UID → timeseries)        │
-│ ❌ Don't mix them! get_mwsid_by_latlon ≠ get_admin_details_by_latlon  │
-└─────────────────────────────────────────────────────────────────────────┘
-
-================================================================================
-ARCHITECTURE OVERVIEW
-================================================================================
-
-LangGraph Workflow:
-  parse_intent → router → [fetch_spatial OR fetch_timeseries] → codeact → format
-
-1. parse_intent: Extract location, metric, time period, data type needed
-2. router: Decide between spatial or timeseries workflow
-3. fetch_spatial: Call Workflow 1 (admin → layers) for spatial data
-4. fetch_timeseries: Call Workflow 2 (watershed → timeseries) for temporal data
-5. codeact: Generate and execute Python code for analysis
-6. format: Create user-friendly response with LLM
-
-Key Features:
 
 ================================================================================
 """
@@ -109,7 +37,6 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CORE_STACK_API_KEY = os.getenv("CORE_STACK_API_KEY")
-GEE_PROJECT = os.getenv("GEE_PROJECT", "apt-achievment-453417-h6")
 
 if not GEMINI_API_KEY or not CORE_STACK_API_KEY:
     raise ValueError("GEMINI_API_KEY and CORE_STACK_API_KEY must be set in environment")
@@ -118,17 +45,9 @@ if not GEMINI_API_KEY or not CORE_STACK_API_KEY:
 BASE_URL = "https://geoserver.core-stack.org/api/v1/"
 API_HEADERS = {"X-API-Key": CORE_STACK_API_KEY}
 
-# Initialize Earth Engine
-try:
-    import ee
-    ee.Initialize(project=GEE_PROJECT)
-    print(f"✅ Earth Engine initialized with project: {GEE_PROJECT}")
-except Exception as e:
-    print(f"⚠️  Earth Engine initialization warning: {e}")
-
 
 # ============================================================================
-# CORESTACK API WRAPPER FUNCTIONS (Following Swagger Spec)
+# CORESTACK API WRAPPER FUNCTIONS 
 # ============================================================================
 
 class CoreStackAPI:
@@ -328,75 +247,64 @@ class CoreStackAPI:
         
         return watershed_info, timeseries_data
     
-    def find_nearest_watershed(self, latitude: float, longitude: float, 
-                               max_distance_km: float = 10.0) -> Optional[Dict]:
-        """
-        Find nearest watershed with data using concentric spatial search.
-        Useful when exact coordinates don't have watershed coverage.
+    # def find_nearest_watershed(self, latitude: float, longitude: float, 
+    #                            max_distance_km: float = 10.0) -> Optional[Dict]:
+    #     """
+    #     Find nearest watershed with data using concentric spatial search.
+    #     Useful when exact coordinates don't have watershed coverage.
         
-        Parameters:
-            latitude: Center latitude
-            longitude: Center longitude
-            max_distance_km: Maximum search radius in km
+    #     Parameters:
+    #         latitude: Center latitude
+    #         longitude: Center longitude
+    #         max_distance_km: Maximum search radius in km
         
-        Returns: Watershed info with 'distance_km' field, or None if not found
-        """
-        print(f"\n🔍 SEARCHING FOR NEAREST WATERSHED (max {max_distance_km}km)")
+    #     Returns: Watershed info with 'distance_km' field, or None if not found
+    #     """
+    #     print(f"\n🔍 SEARCHING FOR NEAREST WATERSHED (max {max_distance_km}km)")
         
-        # Try exact location first
-        try:
-            result = self.get_mwsid_by_latlon(latitude, longitude)
-            result['distance_km'] = 0
-            result['original_lat'] = latitude
-            result['original_lon'] = longitude
-            print(f"✅ Found watershed at exact location")
-            return result
-        except:
-            print(f"⚠️  No watershed at exact location, expanding search...")
+    #     # Try exact location first
+    #     try:
+    #         result = self.get_mwsid_by_latlon(latitude, longitude)
+    #         result['distance_km'] = 0
+    #         result['original_lat'] = latitude
+    #         result['original_lon'] = longitude
+    #         print(f"✅ Found watershed at exact location")
+    #         return result
+    #     except:
+    #         print(f"⚠️  No watershed at exact location, expanding search...")
         
-        # Concentric search
-        search_radii = [0.5, 1.0, 2.0, 5.0, max_distance_km]
-        geod = pyproj.Geod(ellps="WGS84")
+    #     # Concentric search
+    #     search_radii = [0.5, 1.0, 2.0, 5.0, max_distance_km]
+    #     geod = pyproj.Geod(ellps="WGS84")
         
-        for radius_km in search_radii:
-            # Search in 4 cardinal directions
-            for angle in [0, 90, 180, 270]:  # N, E, S, W
-                search_lon, search_lat, _ = geod.fwd(longitude, latitude, angle, radius_km * 1000)
+    #     for radius_km in search_radii:
+    #         # Search in 4 cardinal directions
+    #         for angle in [0, 90, 180, 270]:  # N, E, S, W
+    #             search_lon, search_lat, _ = geod.fwd(longitude, latitude, angle, radius_km * 1000)
                 
-                try:
-                    result = self.get_mwsid_by_latlon(search_lat, search_lon)
-                    result['distance_km'] = radius_km
-                    result['original_lat'] = latitude
-                    result['original_lon'] = longitude
-                    print(f"✅ Found watershed {radius_km}km away at ({search_lat:.5f}, {search_lon:.5f})")
-                    return result
-                except:
-                    continue
+    #             try:
+    #                 result = self.get_mwsid_by_latlon(search_lat, search_lon)
+    #                 result['distance_km'] = radius_km
+    #                 result['original_lat'] = latitude
+    #                 result['original_lon'] = longitude
+    #                 print(f"✅ Found watershed {radius_km}km away at ({search_lat:.5f}, {search_lon:.5f})")
+    #                 return result
+    #             except:
+    #                 continue
         
-        print(f"❌ No watershed found within {max_distance_km}km")
-        return None
+    #     print(f"❌ No watershed found within {max_distance_km}km")
+    #     return None
 
 
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def geocode_location(location_name: str, district: str = None, state: str = None) -> Optional[Tuple[float, float]]:
+def geocode_location(location_name: str) -> Optional[Tuple[float, float]]:
     """Geocode a location name to coordinates (latitude, longitude)"""
     try:
         geolocator = Nominatim(user_agent="geospatial_agent")
-        
-        # Build query with context for disambiguation
-        if district and state:
-            query = f"{location_name}, {district}, {state}, India"
-        elif state:
-            query = f"{location_name}, {state}, India"
-        else:
-            query = f"{location_name}, India"
-        
-        print(f"🔍 Geocoding: {query}")
-        location = geolocator.geocode(query)
-        
+        location = geolocator.geocode(location_name)
         if location:
             return (location.latitude, location.longitude)
     except Exception as e:
@@ -437,44 +345,6 @@ def geodesic_buffer(lon: float, lat: float, radius_m: float, out_crs: str = "EPS
 
 # Initialize API wrapper
 api = CoreStackAPI(api_key=CORE_STACK_API_KEY)
-
-
-# ============================================================================
-# LAYER DESCRIPTIONS LOADER
-# ============================================================================
-
-def load_layer_descriptions() -> str:
-    """
-    Load layer descriptions from CSV for LLM context
-    """
-    try:
-        csv_path = os.path.join(os.path.dirname(__file__), 'layer_descriptions.csv')
-        import csv
-        
-        descriptions = []
-        with open(csv_path, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                descriptions.append(
-                    f"- {row['layer_name']}: {row['layer_description'][:200]}..."
-                )
-        
-        return "\n".join(descriptions)
-    except Exception as e:
-        print(f"⚠️  Could not load layer descriptions: {e}")
-        return """
-CoreStack provides:
-- land_use_land_cover_raster: LULC with 12 classes including cropping intensity (classes 8-11)
-- change_tree_cover_loss_raster: Pre-computed tree loss 2017-2022
-- change_tree_cover_gain_raster: Pre-computed tree gain 2017-2022
-- change_urbanization_raster: Built-up expansion 2017-2022 (class 3 = Crops→BuiltUp)
-- change_cropping_reduction_raster: Cropland degradation 2017-2022
-- change_cropping_intensity_raster: Cropping intensity transitions 2017-2022
-- cropping_intensity_vector: Vector with yearly cropping intensity values
-- surface_water_bodies_vector: Water bodies with seasonal availability
-- drought_frequency_vector: Drought severity mapping
-- water_balance: Fortnightly timeseries at watershed level
-"""
 
 
 # ============================================================================
@@ -932,9 +802,12 @@ NOW GENERATE CODE (Python only, no markdown):"""
 # ============================================================================
 
 def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse user query using LLM with full CoreStack layer knowledge"""
+    """
+    FIXED: Parse user query with proper data product classification.
+    Maps queries to actual CoreStack layers.
+    """
     print("\n" + "="*70)
-    print("🧠 PARSING USER INTENT (LLM-Driven)")
+    print("🧠 PARSING INTENT")
     print("="*70)
     
     user_query = state["user_query"]
@@ -945,331 +818,82 @@ def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
         google_api_key=GEMINI_API_KEY
     )
     
-    # Load layer descriptions for LLM context
-    layer_descriptions = load_layer_descriptions()
-    
-    prompt = f"""You are a geospatial data routing agent for CoreStack API.
+    prompt = f"""Extract structured information from this geospatial query.
 
 USER QUERY: "{user_query}"
 
-AVAILABLE CORESTACK LAYERS:
-{layer_descriptions}
+CRITICAL: Map to correct CoreStack data product:
 
-TASK: Analyze this query and extract:
+1. "Cropping intensity over years" → data_type="spatial_vector", layer="cropping_intensity_vector"
+   (NOT timeseries! It has yearly columns: cropping_intensity_2017, 2018, ...)
 
-1. LOCATION INFORMATION:
-   - Type: village|tehsil|district|state|coordinates
-   - Name (if place name mentioned)
-   - Coordinates (if lat/lon mentioned)
-   - Does this location likely span multiple administrative boundaries? 
-     (Village names often span multiple tehsils - set multi_region_likely: true for villages)
+2. "Surface water over years/seasons" → data_type="spatial_vector", layer="surface_water_bodies_vector"
+   (Polygon water bodies with seasonal attributes, NOT watershed timeseries)
 
-2. METRIC/ANALYSIS:
-   - What is being measured? (cropping intensity, tree cover, water, drought, etc.)
-   - Is this a CHANGE DETECTION query? (keywords: "change", "loss", "gain", "since", "turned into")
-   - Is this a TEMPORAL TREND query? (keywords: "over years", "trends", "how has X changed")
-   - Time period (years mentioned)
+3. "Tree cover loss" → data_type="change_raster", layer="change_tree_cover_loss_raster"
+   (Pre-computed 2017-2022 composite, mask to loss classes)
 
-3. DATA SOURCE ROUTING:
-   - Which CoreStack layers are most relevant? Pick from the layer descriptions above.
-   - Prioritize PRE-COMPUTED layers when available:
-     a) CHANGE DETECTION LAYERS (2017-2022): change_tree_cover_loss_raster, change_urbanization_raster, etc.
-     b) TEMPORAL VECTOR LAYERS: cropping_intensity_vector (has yearly attributes), surface_water_bodies_vector
-     c) TIMESERIES API: water_balance, precipitation (via get_mws_data at watershed level)
-     d) STATIC SPATIAL: SOGE, aquifer, drought_frequency_vector
-   
-   - Routing decision:
-     * If pre-computed change layer exists → "corestack_spatial"
-     * If vector has temporal attributes → "corestack_spatial"
-     * If needs watershed timeseries (water_balance, precipitation) → "corestack_timeseries"
-     * Default → "corestack_spatial"
+4. "Cropland to built-up" → data_type="change_raster", layer="change_urbanization_raster"
+   (Filter to class 3: Trees/Crops→Built-up)
 
-4. MULTI-REGION DETECTION:
-   - If location_type is "village" → set multi_region_likely: true (villages often span tehsils)
-   - If location_type is "coordinates" → set multi_region_likely: false
-   - If location_type is "tehsil" or higher → set multi_region_likely: false
+5. "Drought in tehsils" → data_type="spatial_vector", layer="drought_frequency_vector"
+   (Severity: Severe/Moderate/Mild, aggregate to tehsil)
 
-Return ONLY valid JSON:
+Return JSON:
 {{
   "latitude": <float or null>,
   "longitude": <float or null>,
   "location_name": <string or null>,
-  "district_name": <string or null>,
-  "state_name": <string or null>,
-  "location_type": "village|tehsil|district|state|coordinates",
-  "metric_text": <string>,
+  "location_type": "village" | "tehsil" | "state" | "coordinates",
+  "district": <string or null>,
+  "metric": <string>,
+  "temporal": <bool>,
   "start_year": <int or null>,
   "end_year": <int or null>,
-  "is_change_detection": <boolean>,
-  "is_temporal_trend": <boolean>,
-  "target_layers": ["layer_name_1", "layer_name_2"],
-  "data_source_type": "corestack_spatial|corestack_timeseries|hybrid",
-  "multi_region_likely": <boolean>,
-  "reasoning": "Brief explanation of routing decision"
+  "data_type_needed": "spatial_vector" | "change_raster" | "timeseries",
+  "analysis_type": "temporal_vector" | "change_detection" | "state_aggregation" | "spatial_summary",
+  "recommended_layer": "cropping_intensity_vector" | "surface_water_bodies_vector" | 
+                       "change_tree_cover_loss_raster" | "change_urbanization_raster" | 
+                       "drought_frequency_vector" | "other",
+  "notes": <string with caveats if needed>
 }}
 
-EXAMPLES:
-
-Query: "Cropping intensity in Shirur village, Dharwad over the years"
-→ {{
-  "location_name": "Shirur",
-  "district_name": "Dharwad",
-  "state_name": "Karnataka",
-  "location_type": "village",
-  "metric_text": "cropping intensity",
-  "is_temporal_trend": true,
-  "target_layers": ["cropping_intensity_vector"],
-  "data_source_type": "corestack_spatial",
-  "multi_region_likely": true,
-  "reasoning": "cropping_intensity_vector has yearly attributes; villages often span tehsils"
-}}
-
-Query: "Tree cover loss since 2018 in Shirur, Dharwad, Karnataka"
-→ {{
-  "location_name": "Shirur",
-  "location_type": "village",
-  "metric_text": "tree cover loss",
-  "start_year": 2018,
-  "is_change_detection": true,
-  "target_layers": ["change_tree_cover_loss_raster"],
-  "data_source_type": "corestack_spatial",
-  "multi_region_likely": true,
-  "reasoning": "Pre-computed change layer available for 2017-2022, masks to loss classes"
-}}
-
-Query: "Cropland to built-up in Shirur since 2018"
-→ {{
-  "location_name": "Shirur",
-  "location_type": "village",
-  "metric_text": "cropland to built-up conversion",
-  "start_year": 2018,
-  "is_change_detection": true,
-  "target_layers": ["change_urbanization_raster"],
-  "data_source_type": "corestack_spatial",
-  "multi_region_likely": true,
-  "reasoning": "change_urbanization_raster class 3 = Crops→BuiltUp"
-}}
-
-Query: "Surface water availability over years in Shirur"
-→ {{
-  "location_name": "Shirur",
-  "location_type": "village",
-  "metric_text": "surface water availability",
-  "is_temporal_trend": true,
-  "target_layers": ["surface_water_bodies_vector"],
-  "data_source_type": "corestack_spatial",
-  "multi_region_likely": true,
-  "reasoning": "surface_water_bodies_vector has seasonal availability and area over years"
-}}
-
-Query: "Drought affected tehsils in Jharkhand"
-→ {{
-  "location_name": "Jharkhand",
-  "location_type": "state",
-  "metric_text": "drought frequency",
-  "target_layers": ["drought_frequency_vector"],
-  "data_source_type": "corestack_spatial",
-  "multi_region_likely": false,
-  "reasoning": "State-level query using drought_frequency_vector"
-}}
-
-Query: "Water balance trends at 15.23, 75.27"
-→ {{
-  "latitude": 15.23,
-  "longitude": 75.27,
-  "location_type": "coordinates",
-  "metric_text": "water balance",
-  "is_temporal_trend": true,
-  "data_source_type": "corestack_timeseries",
-  "multi_region_likely": false,
-  "reasoning": "Timeseries API provides fortnightly water balance per watershed"
-}}
+RULES:
+- If query mentions "years" or "trend" AND metric is cropping/water → data_type="spatial_vector" (NOT timeseries)
+- If query mentions "change", "loss", "gain", "conversion" → data_type="change_raster"
+- If query mentions state + drought → data_type="spatial_vector", analysis_type="state_aggregation"
+- Only use timeseries for watershed-level water balance (rare)
 """
 
     try:
         response = llm.invoke(prompt)
-        content = response.content
+        content = response.content.strip()
+        content = re.sub(r"^```json\s*|```$", "", content, flags=re.MULTILINE).strip()
+        parsed = json.loads(content)
         
-        # Extract JSON from response
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group())
-        else:
-            parsed = json.loads(content)
+        # Geocode if needed
+        if parsed.get('location_name') and not parsed.get('latitude'):
+            coords = geocode_location(parsed['location_name'])
+            if coords:
+                parsed['latitude'], parsed['longitude'] = coords
+                print(f"🌍 Geocoded '{parsed['location_name']}' → ({coords[0]:.5f}, {coords[1]:.5f})")
         
         state["parsed"] = parsed
         
-        # Geocode location name if provided but no coordinates
-        if parsed.get("location_name") and not parsed.get("latitude"):
-            coords = geocode_location(
-                parsed["location_name"],
-                district=parsed.get("district_name"),
-                state=parsed.get("state_name")
-            )
-            if coords:
-                state["parsed"]["latitude"], state["parsed"]["longitude"] = coords
-                print(f"📍 Geocoded '{parsed['location_name']}' to {coords}")
-        
-        print(f"\n✅ LLM Routing Decision:")
-        print(f"   Location: {parsed.get('location_name', 'N/A')} ({parsed.get('location_type')})")
-        print(f"   Coordinates: ({parsed.get('latitude')}, {parsed.get('longitude')})")
-        print(f"   Metric: {parsed.get('metric_text')}")
-        print(f"   Target Layers: {parsed.get('target_layers', [])}")
-        print(f"   Data Source: {parsed.get('data_source_type')}")
-        print(f"   Multi-Region Likely: {parsed.get('multi_region_likely', False)}")
-        print(f"   Reasoning: {parsed.get('reasoning', 'N/A')}")
+        print(f"\n✅ PARSED INTENT:")
+        print(f"   Data Type: {parsed.get('data_type_needed')}")
+        print(f"   Analysis Type: {parsed.get('analysis_type')}")
+        print(f"   Layer: {parsed.get('recommended_layer')}")
+        location_display = parsed.get('location_name') or f"({parsed.get('latitude')}, {parsed.get('longitude')})"
+        print(f"   Location: {location_display}")
         
     except Exception as e:
-        print(f"❌ Intent parsing failed: {e}")
         state["error"] = f"Intent parsing failed: {str(e)}"
+        print(f"❌ ERROR: {state['error']}")
     
     return state
 
 
-def resolve_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Resolve exact geometry for multi-region locations using microwatershed boundaries.
-    Only runs if LLM flagged multi_region_likely=True.
-    """
-    
-    if "error" in state:
-        return state
-    
-    parsed = state["parsed"]
-    
-    # Skip if not multi-region
-    if not parsed.get("multi_region_likely", False):
-        print("\n⏭️  Skipping geometry resolution - single region query")
-        return state
-    
-    print("\n" + "="*70)
-    print("🗺️  RESOLVING MULTI-REGION GEOMETRY")
-    print("="*70)
-    
-    location_name = parsed.get("location_name")
-    location_type = parsed.get("location_type")
-    
-    if not location_name:
-        print("⚠️  No location name for geometry resolution")
-        return state
-    
-    try:
-        if location_type == "village":
-            print(f"🔍 Looking up village: {location_name}")
-            district = parsed.get('district_name')
-            state_name = parsed.get('state_name')
-            latitude = parsed.get('latitude')
-            longitude = parsed.get('longitude')
-            
-            # Use local microwatershed boundaries instead of GEE
-            import geopandas as gpd
-            from shapely.geometry import Point
-            from shapely.ops import transform as shp_transform
-            import pyproj
-            
-            mws_path = "/Users/suhanijain/Desktop/sem 7/Geospacial agent/agent-env/Microwatershed_boundries_v2.geojson"
-            
-            print(f"📂 Loading microwatershed boundaries from local file...")
-            # Load with low_memory=False to handle large file
-            mws_gdf = gpd.read_file(mws_path)
-            print(f"✅ Loaded {len(mws_gdf)} microwatershed polygons")
-            
-            # Try to find village by name in microwatershed attribute data
-            # MWS data may have village_name, village, or similar columns
-            village_cols = [col for col in mws_gdf.columns if 'village' in col.lower()]
-            
-            village_geom = None
-            if village_cols:
-                # Try to find village by name
-                for col in village_cols:
-                    matches = mws_gdf[mws_gdf[col].str.contains(location_name, case=False, na=False)]
-                    if len(matches) > 0:
-                        print(f"   ✅ Found {len(matches)} microwatersheds in village '{location_name}' using column '{col}'")
-                        village_geom = matches.unary_union
-                        break
-            
-            # Fallback: Use coordinate-based buffer to approximate village area
-            if village_geom is None and latitude and longitude:
-                print(f"   ⚠️  Village name not found in MWS data. Using coordinate buffer...")
-                center = Point(longitude, latitude)
-                
-                # Create 2km buffer around coordinates (typical village size)
-                wgs84 = pyproj.CRS('EPSG:4326')
-                utm = pyproj.CRS('EPSG:32643')  # India UTM
-                project_to_utm = pyproj.Transformer.from_crs(wgs84, utm, always_xy=True).transform
-                project_to_wgs = pyproj.Transformer.from_crs(utm, wgs84, always_xy=True).transform
-                
-                center_utm = shp_transform(project_to_utm, center)
-                buffer_utm = center_utm.buffer(2000)  # 2km radius
-                village_geom = shp_transform(project_to_wgs, buffer_utm)
-                print(f"   📍 Created 2km buffer around ({latitude:.4f}, {longitude:.4f})")
-            
-            if village_geom is None:
-                print(f"⚠️  Village '{location_name}' not found in microwatershed boundaries")
-                print(f"   → Will fetch data at TEHSIL level and aggregate across all microwatersheds")
-                state["geometry_info"] = {
-                    "type": "village_fallback_to_tehsil",
-                    "name": location_name,
-                    "note": "Village boundary not available - using tehsil-level MWS aggregation"
-                }
-                return state
-            
-            # Get village geometry bounds
-            minx, miny, maxx, maxy = village_geom.bounds
-            
-            # Find all tehsils intersecting with village using coordinate-based API lookup
-            # Sample points within village geometry to find all intersecting admin units
-            import numpy as np
-            
-            # Sample points in a grid across village area
-            num_samples = 5  # 5x5 grid
-            lons = np.linspace(minx, maxx, num_samples)
-            lats = np.linspace(miny, maxy, num_samples)
-            
-            intersecting_admin = set()
-            for lat in lats:
-                for lon in lons:
-                    point = Point(lon, lat)
-                    if village_geom.contains(point):
-                        # Get admin details for this point
-                        admin = api.get_admin_details_by_latlon(lat, lon)
-                        admin_key = f"{admin['State']}|{admin['District']}|{admin['Tehsil']}"
-                        intersecting_admin.add(admin_key)
-            
-            # Parse admin units from coordinate sampling
-            admin_units = []
-            for admin_key in intersecting_admin:
-                parts = admin_key.split('|')
-                admin_units.append({
-                    'State': parts[0],
-                    'District': parts[1],
-                    'Tehsil': parts[2]
-                })
-            
-            print(f"✅ Found {len(admin_units)} intersecting admin units:")
-            for unit in admin_units:
-                print(f"   - {unit['Tehsil']}, {unit['District']}, {unit['State']}")
-            
-            state["geometry_info"] = {
-                "type": "village",
-                "name": location_name,
-                "geometry": village_geom,
-                "intersecting_units": admin_units,
-                "multi_region": len(admin_units) > 1
-            }
-        
-        elif location_type == "tehsil":
-            # For tehsil-level queries, could get tehsil boundary
-            # But usually not needed for multi-region handling
-            pass
-    
-    except Exception as e:
-        print(f"⚠️  Geometry resolution failed: {e}")
-        import traceback
-        traceback.print_exc()
-        print("   Falling back to coordinate-based lookup")
-    
-    return state
 def fetch_spatial_layers(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Fetch available spatial layers for the location.
@@ -1279,14 +903,12 @@ def fetch_spatial_layers(state: Dict[str, Any]) -> Dict[str, Any]:
         return state
     
     print("\n" + "="*70)
-    print("📡 FETCHING SPATIAL LAYERS (Target-Filtered)")
+    print("📡 FETCHING SPATIAL LAYERS")
     print("="*70)
     
     parsed = state["parsed"]
     latitude = parsed.get("latitude")
     longitude = parsed.get("longitude")
-    target_layers = parsed.get("target_layers", [])
-    geometry_info = state.get("geometry_info")
     
     if not latitude or not longitude:
         state["error"] = "Coordinates required for spatial analysis"
@@ -1294,92 +916,21 @@ def fetch_spatial_layers(state: Dict[str, Any]) -> Dict[str, Any]:
         return state
     
     try:
-        all_layers = []
-        
-        # Determine admin units to query
-        if geometry_info and geometry_info.get("multi_region"):
-            # Multi-region: fetch from all intersecting admin units
-            admin_units = geometry_info["intersecting_units"]
-            print(f"🌍 Multi-region query: Fetching from {len(admin_units)} admin units")
-        else:
-            # Single region: use coordinate lookup
-            admin_info = api.get_admin_details_by_latlon(latitude, longitude)
-            admin_units = [admin_info]
-        
-        # Fetch layers from each admin unit and tag with source
-        for admin_info in admin_units:
-            state_name = admin_info["State"]
-            district_name = admin_info["District"]
-            tehsil_name = admin_info["Tehsil"]
-            
-            print(f"   📍 Fetching from: {tehsil_name}, {district_name}, {state_name}")
-            
-            layers = api.get_generated_layer_urls(state_name, district_name, tehsil_name)
-            
-            # Filter to target layers if specified
-            # LLM already chose the exact layers we need - just filter by exact name match
-            if target_layers:
-                # Case-insensitive partial matching for robustness
-                filtered_layers = []
-                for layer in layers:
-                    layer_name = layer.get('layer_name', '').lower().replace(' ', '_').replace('-', '_')
-                    for target in target_layers:
-                        target_clean = target.lower().replace('_vector', '').replace('_raster', '')
-                        # Match if target is substring of layer name (e.g., "cropping_intensity" matches "Cropping Intensity")
-                        if target_clean in layer_name:
-                            # Tag layer with source tehsil for merging
-                            layer['source_tehsil'] = tehsil_name
-                            layer['source_district'] = district_name
-                            layer['source_state'] = state_name
-                            filtered_layers.append(layer)
-                            break
-                layers = filtered_layers
-                print(f"      → LLM selected {len(layers)} layers from {tehsil_name}: {[l.get('layer_name') for l in layers[:3]]}")
-            
-            all_layers.extend(layers)
-        
-        # Group layers by name for potential merging (when multi-region)
-        from collections import defaultdict
-        layers_by_name = defaultdict(list)
-        for layer in all_layers:
-            layers_by_name[layer['layer_name']].append(layer)
-        
-        # Mark layers that need merging (same name from multiple tehsils)
-        merged_layers = []
-        for layer_name, layer_group in layers_by_name.items():
-            if len(layer_group) > 1:
-                # Multiple sources - needs merging
-                print(f"   🔗 Layer '{layer_name}' found in {len(layer_group)} tehsils - will merge")
-                # Use first as representative, but add merge metadata
-                representative = layer_group[0].copy()
-                representative['merge_required'] = True
-                representative['merge_sources'] = [{
-                    'url': l['layer_url'],
-                    'tehsil': l.get('source_tehsil'),
-                    'district': l.get('source_district'),
-                    'state': l.get('source_state')
-                } for l in layer_group]
-                merged_layers.append(representative)
-            else:
-                merged_layers.append(layer_group[0])
+        # Use coupled API workflow
+        admin_info, layers = api.get_spatial_layers_by_coordinates(latitude, longitude)
         
         # Categorize layers by type
-        vector_layers = [l for l in merged_layers if l.get('layer_type') == 'vector']
-        raster_layers = [l for l in merged_layers if l.get('layer_type') == 'raster']
+        vector_layers = [l for l in layers if l.get('layer_type') == 'vector']
+        raster_layers = [l for l in layers if l.get('layer_type') == 'raster']
         
         state["available_layers"] = {
             'vector': vector_layers,
             'raster': raster_layers,
-            'all': merged_layers
+            'all': layers
         }
-        state["location_info"] = admin_units[0] if admin_units else {}
+        state["location_info"] = admin_info
         
         print(f"\n✅ SUCCESS: Retrieved {len(vector_layers)} vector + {len(raster_layers)} raster layers")
-        if target_layers:
-            print(f"   🎯 Filtered to target layers: {target_layers}")
-        if geometry_info and geometry_info.get("multi_region"):
-            multi_source_count = sum(1 for l in merged_layers if l.get('merge_required'))
-            print(f"   🔗 {multi_source_count} layers require multi-tehsil merging")
         
     except Exception as e:
         state["error"] = str(e)
@@ -1447,10 +998,10 @@ def codeact_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Get inputs
     query = state["user_query"]
     parsed = state.get("parsed", {})
-    data_source = parsed.get("data_source_type", "corestack_spatial")
+    data_type = parsed.get("data_type_needed", "spatial")
     
     # Prepare data based on type
-    if data_source == "corestack_timeseries":
+    if data_type == "timeseries":
         # Timeseries analysis
         timeseries_raw = state.get("timeseries_raw", {})
         watershed_info = state.get("watershed_info", {})
@@ -1483,18 +1034,16 @@ def codeact_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if not selected_layers['vector'] and not selected_layers['raster']:
             selected_layers = available_layers
         
-        # STEP 3: Generate code (using selected/filtered layers only)
+        # STEP 3: Generate code
         code = agent.generate_code(query, plan, selected_layers)
         
-        # STEP 4: Prepare execution context with ONLY the target layers
-        # This prevents overwhelming CodeAct with all 66 layers when only 1-2 are needed
+        # STEP 4: Prepare execution context
         context = {
             'query_lat': parsed.get('latitude'),
             'query_lon': parsed.get('longitude'),
-            'vector_layers': selected_layers.get('vector', []),  # Already filtered by plan
-            'raster_layers': selected_layers.get('raster', []),  # Already filtered by plan
-            'query': query,
-            'target_layer_names': parsed.get('target_layers', [])  # Pass LLM's layer selection
+            'vector_layers': selected_layers.get('vector', []),
+            'raster_layers': selected_layers.get('raster', []),
+            'query': query
         }
         
         # STEP 5: Execute code
@@ -1591,56 +1140,46 @@ Generate a user-friendly response:"""
 
 def router_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Simple router based on LLM's data_source_type decision.
-    The heavy lifting was done in intent parsing.
+    Route to appropriate processing path based on data type needed.
+    Routes: timeseries, spatial, or both
     """
     if "error" in state:
         state["next_node"] = "format"
         return state
     
     parsed = state["parsed"]
-    data_source = parsed.get("data_source_type", "corestack_spatial")
+    data_type = parsed.get("data_type_needed", "spatial")
     
     print("\n" + "="*70)
-    print(f"🔀 ROUTING: {data_source}")
+    print(f"🔀 ROUTING DECISION: {data_type}")
     print("="*70)
     
-    # Trust LLM's routing decision
-    routing_map = {
-        "corestack_spatial": "fetch_spatial",
-        "corestack_timeseries": "fetch_timeseries",
-        "hybrid": "fetch_spatial"  # Fetch spatial first, timeseries in codeact if needed
-    }
-    
-    state["next_node"] = routing_map.get(data_source, "fetch_spatial")
+    if data_type == "timeseries":
+        state["next_node"] = "fetch_timeseries"
+    elif data_type in ["spatial", "vector", "raster", "both"]:
+        state["next_node"] = "fetch_spatial"
+    else:
+        # Default to spatial for safety
+        state["next_node"] = "fetch_spatial"
     
     print(f"➡️  Next node: {state['next_node']}")
     return state
 
 
-def build_graph(skip_codeact: bool = False) -> StateGraph:
-    """Build the LangGraph workflow with router and geometry resolution
-    
-    Args:
-        skip_codeact: If True, skip CodeAct node (used when called as tool from Architecture4)
-    """
+def build_graph() -> StateGraph:
+    """Build the LangGraph workflow with router"""
     graph = StateGraph(dict)
     
     # Add nodes
     graph.add_node("parse_intent", llm_intent_parser)
-    graph.add_node("resolve_geometry", resolve_geometry)
     graph.add_node("router", router_node)
     graph.add_node("fetch_spatial", fetch_spatial_layers)
     graph.add_node("fetch_timeseries", fetch_timeseries_data)
-    
-    if not skip_codeact:
-        graph.add_node("codeact", codeact_node)
-        
+    graph.add_node("codeact", codeact_node)
     graph.add_node("format", format_response)
     
     # Add edges
-    graph.add_edge("parse_intent", "resolve_geometry")
-    graph.add_edge("resolve_geometry", "router")
+    graph.add_edge("parse_intent", "router")
     
     # Router conditional edges
     graph.add_conditional_edges(
@@ -1653,16 +1192,10 @@ def build_graph(skip_codeact: bool = False) -> StateGraph:
         }
     )
     
-    # Connect fetch nodes to either codeact or format
-    if skip_codeact:
-        # When used as tool: fetch → format (skip codeact)
-        graph.add_edge("fetch_spatial", "format")
-        graph.add_edge("fetch_timeseries", "format")
-    else:
-        # When standalone: fetch → codeact → format
-        graph.add_edge("fetch_spatial", "codeact")
-        graph.add_edge("fetch_timeseries", "codeact")
-        graph.add_edge("codeact", "format")
+    # Both paths lead to CodeAct
+    graph.add_edge("fetch_spatial", "codeact")
+    graph.add_edge("fetch_timeseries", "codeact")
+    graph.add_edge("codeact", "format")
     
     # Set entry and finish points
     graph.set_entry_point("parse_intent")
@@ -1743,3 +1276,6 @@ if __name__ == "__main__":
     
     # Run first spatial query
     run_agent("How much cropland in Shirur, Dharwad, Karnataka has turned into built up since 2018? can you show me those regions?no")
+
+
+"""One more thing. I have this geogson of village boundries. Can this help with boundry level flexibility? I need you to spend time understnading the data products we have access to and putting them elegantly into a good workflow that we discussed on top. Understood? """
