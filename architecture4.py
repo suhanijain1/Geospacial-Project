@@ -78,44 +78,31 @@ CORESTACK_DATA_PRODUCTS = {
 @tool
 def fetch_corestack_data(query: str) -> str:
     """
-    Fetches geospatial data from CoreStack API using LangGraph workflow.
-    
-    This tool provides access to CoreStack geospatial database with automatic
-    API coupling. It handles the complex workflow of calling multiple APIs in
-    the correct sequence.
-    
-    Args:
-        query: Natural language description of what data you need
-               Examples:
-               - "water bodies near 25.31, 75.09"
-               - "cropping intensity 2017-2023 at 25.31, 75.09"
-               - "NDVI layers for Rajasthan Bhilwara Mandalgarh"
-    
-    Returns:
-        JSON string with available layers or timeseries data
+    FIXED: Fetches and merges geospatial data using improved LangGraph workflow.
+    Returns clean, clipped data ready for CodeAct analysis.
     """
     import json
     import sys
     import os
     
-    # Add parent directory to path to import new_architecture
+    # Add parent directory to path
     workspace_path = '/app/workspace'
     if workspace_path not in sys.path:
         sys.path.insert(0, workspace_path)
     
-    # Now import (will work in Docker if file is mounted)
     from new_architecture import build_graph
     
     print("\n" + "="*70)
-    print("🔧 TOOL: fetch_corestack_data")
-    print(f"📝 Query: {query}")
+    print("📊 CORESTACK DATA FETCHER (via LangGraph)")
+    print(f"   Query: {query}")
     print("="*70)
     
     try:
-        # Build and run LangGraph workflow (skip codeact since Architecture4 handles that)
-        graph = build_graph(skip_codeact=True)
+        # Build and compile graph
+        graph = build_graph()
         app = graph.compile()
         
+        # Run workflow
         state = {"user_query": query}
         result_state = app.invoke(state)
         
@@ -126,57 +113,51 @@ def fetch_corestack_data(query: str) -> str:
                 "error": result_state["error"]
             }, indent=2)
         
-        # Extract relevant data
-        parsed = result_state.get("parsed", {})
-        data_source = parsed.get("data_source_type", "corestack_spatial")
+        # Extract results
+        merged_data_type = result_state.get("merged_data_type")
         
-        # Map data_source_type to simple data_type for response
-        if data_source == "corestack_timeseries":
-            data_type = "timeseries"
+        if merged_data_type == "vector":
+            # Return vector data info
+            merged_gdf = result_state.get("merged_data")
+            
+            response = {
+                "success": True,
+                "data_type": "vector",
+                "feature_count": len(merged_gdf),
+                "columns": list(merged_gdf.columns),
+                "sample_features": merged_gdf.head(3).to_dict(),
+                "geojson_path": result_state.get("merged_data_path"),
+                "bounds": str(merged_gdf.total_bounds)
+            }
+            
+        elif merged_data_type == "raster":
+            # Return raster data info
+            import rasterio
+            
+            raster_path = result_state.get("merged_data_path")
+            with rasterio.open(raster_path) as src:
+                response = {
+                    "success": True,
+                    "data_type": "raster",
+                    "shape": (src.height, src.width),
+                    "crs": str(src.crs),
+                    "bounds": src.bounds,
+                    "raster_path": raster_path,
+                    "dtype": str(src.dtypes[0]),
+                    "nodata": src.nodata
+                }
+            
         else:
-            data_type = "spatial"
-        
-        response = {
-            "success": True,
-            "data_type": data_type,
-            "query_interpretation": parsed.get("metric_text", ""),
-            "location": {
-                "coordinates": {
-                    "latitude": parsed.get("latitude"),
-                    "longitude": parsed.get("longitude")
-                },
-                "administrative": result_state.get("location_info", {})
+            response = {
+                "success": True,
+                "message": "Data fetched but no merged data available"
             }
-        }
         
-        if data_type == "spatial":
-            # Return ONLY the filtered target layers (not all 66)
-            available_layers = result_state.get("available_layers", {})
-            vector_layers = available_layers.get("vector", [])
-            raster_layers = available_layers.get("raster", [])
-            
-            # CRITICAL: The layers are already filtered by LLM intent parser
-            # DO NOT return full layer list - CodeAct only needs target layers
-            response["spatial_data"] = {
-                "vector_layers": vector_layers,
-                "raster_layers": raster_layers,
-                "total_layers": len(vector_layers) + len(raster_layers),
-                "note": "These layers are pre-filtered by LLM intent parser based on query"
-            }
-            
-            print(f"✅ Retrieved {response['spatial_data']['total_layers']} TARGET layers ({len(vector_layers)} vector, {len(raster_layers)} raster) - filtered from 66 total")
-            
-        elif data_type == "timeseries":
-            # Return timeseries data
-            response["timeseries_data"] = result_state.get("timeseries_raw", {})
-            response["watershed_info"] = result_state.get("watershed_info", {})
-            print(f"✅ Retrieved timeseries data for watershed {response['watershed_info'].get('uid', 'unknown')}")
-        
-        # Return compact JSON
+        print(f"\n✅ FETCH COMPLETE: {response}")
         return json.dumps(response, default=str)
         
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
+        print(f"\n❌ ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
         return json.dumps({

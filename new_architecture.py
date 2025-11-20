@@ -21,9 +21,12 @@ from langgraph.graph import StateGraph
 from dotenv import load_dotenv
 
 # Geospatial processing imports
+import pandas as pd
 import geopandas as gpd
 import rasterio
 from rasterio.mask import mask
+from rasterio.merge import merge as rio_merge
+from rasterio.mask import mask as rio_mask
 from shapely.geometry import Point, box, shape, Polygon
 from shapely.ops import transform as shp_transform
 import pyproj
@@ -32,8 +35,20 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic as geopy_geodesic
 import numpy as np
 
-# Load environment
+import ee
+import geemap
+ 
 load_dotenv()
+
+# Initialize Earth Engine
+GEE_PROJECT = os.getenv("GEE_PROJECT", "apt-achievment-453417-h6")
+try:
+    ee.Initialize(project=GEE_PROJECT)
+    print(f"✅ Earth Engine initialized with project: {GEE_PROJECT}")
+except Exception as e:
+    print(f"⚠️  Earth Engine initialization failed: {e}")
+
+# ============================================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CORE_STACK_API_KEY = os.getenv("CORE_STACK_API_KEY")
@@ -247,54 +262,6 @@ class CoreStackAPI:
         
         return watershed_info, timeseries_data
     
-    # def find_nearest_watershed(self, latitude: float, longitude: float, 
-    #                            max_distance_km: float = 10.0) -> Optional[Dict]:
-    #     """
-    #     Find nearest watershed with data using concentric spatial search.
-    #     Useful when exact coordinates don't have watershed coverage.
-        
-    #     Parameters:
-    #         latitude: Center latitude
-    #         longitude: Center longitude
-    #         max_distance_km: Maximum search radius in km
-        
-    #     Returns: Watershed info with 'distance_km' field, or None if not found
-    #     """
-    #     print(f"\n🔍 SEARCHING FOR NEAREST WATERSHED (max {max_distance_km}km)")
-        
-    #     # Try exact location first
-    #     try:
-    #         result = self.get_mwsid_by_latlon(latitude, longitude)
-    #         result['distance_km'] = 0
-    #         result['original_lat'] = latitude
-    #         result['original_lon'] = longitude
-    #         print(f"✅ Found watershed at exact location")
-    #         return result
-    #     except:
-    #         print(f"⚠️  No watershed at exact location, expanding search...")
-        
-    #     # Concentric search
-    #     search_radii = [0.5, 1.0, 2.0, 5.0, max_distance_km]
-    #     geod = pyproj.Geod(ellps="WGS84")
-        
-    #     for radius_km in search_radii:
-    #         # Search in 4 cardinal directions
-    #         for angle in [0, 90, 180, 270]:  # N, E, S, W
-    #             search_lon, search_lat, _ = geod.fwd(longitude, latitude, angle, radius_km * 1000)
-                
-    #             try:
-    #                 result = self.get_mwsid_by_latlon(search_lat, search_lon)
-    #                 result['distance_km'] = radius_km
-    #                 result['original_lat'] = latitude
-    #                 result['original_lon'] = longitude
-    #                 print(f"✅ Found watershed {radius_km}km away at ({search_lat:.5f}, {search_lon:.5f})")
-    #                 return result
-    #             except:
-    #                 continue
-        
-    #     print(f"❌ No watershed found within {max_distance_km}km")
-    #     return None
-
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -818,26 +785,186 @@ def llm_intent_parser(state: Dict[str, Any]) -> Dict[str, Any]:
         google_api_key=GEMINI_API_KEY
     )
     
-    prompt = f"""Extract structured information from this geospatial query.
+    prompt = f"""Extract structured information from this geospatial query and map to the CORRECT CoreStack data product.
 
 USER QUERY: "{user_query}"
 
-CRITICAL: Map to correct CoreStack data product:
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL UNDERSTANDING: SPATIAL vs TIMESERIES DATA PRODUCTS
+═══════════════════════════════════════════════════════════════════════════════
 
-1. "Cropping intensity over years" → data_type="spatial_vector", layer="cropping_intensity_vector"
-   (NOT timeseries! It has yearly columns: cropping_intensity_2017, 2018, ...)
+CoreStack has TWO FUNDAMENTALLY DIFFERENT data structures:
 
-2. "Surface water over years/seasons" → data_type="spatial_vector", layer="surface_water_bodies_vector"
-   (Polygon water bodies with seasonal attributes, NOT watershed timeseries)
+1️⃣ SPATIAL DATA (Vectors/Rasters):
+   - Geographic features with SPATIAL VARIATION across a region
+   - Data varies BY LOCATION (different patches/polygons have different values)
+   - Temporal data stored as YEARLY ATTRIBUTE COLUMNS, not timeseries arrays
+   - Example: cropping_intensity_vector has columns: cropping_intensity_2017, cropping_intensity_2018, ..., cropping_intensity_2023
+   - Use for: Village/tehsil-level analysis where spatial variation matters
 
-3. "Tree cover loss" → data_type="change_raster", layer="change_tree_cover_loss_raster"
-   (Pre-computed 2017-2022 composite, mask to loss classes)
+2️⃣ TIMESERIES DATA (Watershed MWS):
+   - Single aggregated value per watershed per time period
+   - NO spatial variation (entire watershed = 1 value)
+   - Fortnightly measurements (water balance components)
+   - Example: water_balance timeseries has arrays: year[], fortnight[], runoff[], precipitation[]
+   - Use for: Watershed water budget analysis only
 
-4. "Cropland to built-up" → data_type="change_raster", layer="change_urbanization_raster"
-   (Filter to class 3: Trees/Crops→Built-up)
+═══════════════════════════════════════════════════════════════════════════════
+DECISION FRAMEWORK WITH EXPLANATIONS
+═══════════════════════════════════════════════════════════════════════════════
 
-5. "Drought in tehsils" → data_type="spatial_vector", layer="drought_frequency_vector"
-   (Severity: Severe/Moderate/Mild, aggregate to tehsil)
+Query 1: "Cropping Intensity in [Village] Over Years"
+───────────────────────────────────────────────────────
+✅ CORRECT: cropping_intensity_vector (spatial_vector)
+❌ WRONG: watershed timeseries
+
+WHY SPATIAL?
+- Cropping intensity is SPATIALLY VARIABLE (different fields have different intensity)
+- You want: total area under crops in village, which varies by location
+- Data structure: GeoDataFrame with polygon features
+- Temporal aspect: Stored as yearly columns (cropping_intensity_2017, 2018, ..., 2023)
+- Analysis: Sum/average these columns across village polygons
+
+WHY NOT TIMESERIES?
+- Watershed timeseries measures aggregate WATER BALANCE (runoff, precip, ET)
+- It's NOT about cropping patterns or land use
+- Timeseries is fortnightly, not yearly
+- Timeseries has NO spatial variation (1 value per watershed)
+
+RECOMMENDED LAYER: "Cropping Intensity" (exact name from CoreStack)
+DATA TYPE: spatial_vector
+ANALYSIS TYPE: temporal_vector (yearly columns)
+
+───────────────────────────────────────────────────────
+
+Query 2: "Surface Water Availability Over Years in [Village]"
+───────────────────────────────────────────────────────
+✅ PRIMARY: surface_water_bodies_vector (spatial_vector)
+⚠️  OPTIONAL CONTEXT: water_balance (timeseries) for watershed-level trends
+
+WHY SPATIAL?
+- Surface water bodies are PHYSICAL FEATURES with geometry (lakes, ponds, reservoirs)
+- You want: total area of water bodies within village boundaries
+- Data structure: Polygon features with seasonal attributes (Kharif/Rabi/Zaid flags)
+- Analysis: Clip polygons to village, sum area per season
+
+WHY NOT JUST TIMESERIES?
+- Watershed water_balance is AGGREGATE (entire watershed, not village-level)
+- Water balance doesn't tell you WHERE water bodies are located
+- You need spatial polygons to answer "how much water in THIS village"
+
+CRITICAL CAVEAT:
+- surface_water_bodies_vector may be a SINGLE SNAPSHOT per year (from LULC conversion)
+- For multi-year TRENDS, you may need to derive from land_use_land_cover_raster
+- Workaround: Count water pixels (classes 2-4) in LULC for years 2017-2024
+
+RECOMMENDED LAYER: "Surface Water Bodies" (exact name from CoreStack)
+DATA TYPE: spatial_vector (primary) + optional timeseries context
+ANALYSIS TYPE: temporal_vector (if multi-year versions exist) OR spatial_summary (single snapshot)
+
+───────────────────────────────────────────────────────
+
+Query 3: "Tree Cover Loss in [Village] Since [Year]"
+───────────────────────────────────────────────────────
+✅ CORRECT: change_tree_cover_loss_raster (change_raster)
+
+WHY CHANGE RASTER?
+- Pre-computed transition matrix: trees (class 6) → other classes
+- Period: 2017-2022 composite (mode of 2017-2019 vs 2020-2022)
+- Classes: Trees→Built-up, Trees→Barren, Trees→Crops, Trees→Shrubs
+- Analysis: Mask to loss classes, count pixels, convert to hectares
+
+WHY NOT LULC YEARLY RASTERS?
+- Change rasters are PRE-COMPUTED and optimized for this exact query
+- Saves computation (no need to manually compare 2017 vs 2022 LULC)
+- Already has transition classes ready to filter
+
+FALLBACK: If custom time period (e.g., "2018-2024"):
+- Use land_use_land_cover_raster for specific years
+- Compare class 6 (trees) presence across years manually
+
+RECOMMENDED LAYER: "Change Tree Cover Loss" (exact name from CoreStack)
+DATA TYPE: change_raster
+ANALYSIS TYPE: change_detection
+
+───────────────────────────────────────────────────────
+
+Query 4: "Cropland to Built-up Conversion in [Village] Since [Year]"
+───────────────────────────────────────────────────────
+✅ CORRECT: change_urbanization_raster (change_raster)
+
+WHY CHANGE RASTER?
+- Pre-computed transition: Crops/Trees → Built-up (class 3 in urbanization raster)
+- Period: 2017-2022 composite
+- Analysis: Filter to class 3, count pixels, convert to hectares
+
+CRITICAL: Class 3 specifically = "Trees/Crops → Built-up"
+- Other classes in this raster: Built-up expansion, Barren→Built-up
+- Must filter correctly to answer "cropland to built-up" query
+
+RECOMMENDED LAYER: "Change Urbanization" (exact name from CoreStack)
+DATA TYPE: change_raster
+ANALYSIS TYPE: change_detection
+
+───────────────────────────────────────────────────────
+
+Query 5: "Drought-Affected Tehsils in [State]"
+───────────────────────────────────────────────────────
+✅ CORRECT: drought_frequency_vector (spatial_vector)
+
+WHY SPATIAL?
+- Drought frequency is SPATIALLY VARIABLE (different MWS/villages have different severity)
+- Data structure: Polygon features with drought severity attributes
+- Categories: Severe/Moderate/Mild drought weeks
+- Analysis: Aggregate to tehsil level, filter by severity threshold
+
+DEFINITION: Drought = #moderate weeks + #severe weeks >= 5
+
+WHY NOT TIMESERIES?
+- Timeseries water_balance has precipitation/runoff but NOT drought classification
+- You'd need to compute drought index yourself from timeseries
+- Drought frequency vector is PRE-COMPUTED spatial layer
+
+RECOMMENDED LAYER: "Drought Frequency" OR "Drought Causality" (exact name from CoreStack)
+DATA TYPE: spatial_vector
+ANALYSIS TYPE: state_aggregation (aggregate MWS/villages to tehsil)
+
+═══════════════════════════════════════════════════════════════════════════════
+AVAILABLE CORESTACK LAYERS (EXACT NAMES - CASE SENSITIVE)
+═══════════════════════════════════════════════════════════════════════════════
+
+SPATIAL VECTORS:
+- "Cropping Intensity" (yearly columns: cropping_intensity_2017, ..., 2023)
+- "Surface Water Bodies" (seasonal flags: Kharif/Rabi/Zaid)
+- "Drought Frequency" (severity: Severe/Moderate/Mild)
+- "Drought Causality" (alternative drought layer)
+- "NREGA" (rural employment scheme assets)
+- "LULC" (vectorized land use polygons)
+- "Aquifer" (groundwater aquifer boundaries)
+- "Terrain Clusters" (elevation/slope groupings)
+- "SOGE" (state of groundwater estimation)
+- "Change Vector Degradation" (land degradation polygons)
+
+CHANGE RASTERS (2017-2022 composites):
+- "Change Tree Cover Loss" (trees → other classes)
+- "Change Tree Cover Gain" (other → trees)
+- "Change Urbanization" (any class → built-up)
+- "Change Cropping Reduction" (crops → other classes)
+- "Change Cropping Intensity" (intensity increase/decrease)
+
+LAND USE RASTERS (yearly, 10m resolution):
+- "LULC_level_1" (12 classes: Built-up, Water, Trees, Crops, etc.)
+- "LULC_level_2" (detailed classes)
+- "Tree Canopy Density High" (yearly)
+- "Tree Canopy Density Low" (yearly)
+
+TIMESERIES (Watershed MWS only):
+- water_balance (fortnightly: precipitation, runoff, ET, soil moisture)
+- NOT for spatial queries or village-level analysis
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════════════
 
 Return JSON:
 {{
@@ -846,24 +973,26 @@ Return JSON:
   "location_name": <string or null>,
   "location_type": "village" | "tehsil" | "state" | "coordinates",
   "district": <string or null>,
-  "metric": <string>,
-  "temporal": <bool>,
+  "metric": <string describing what user wants to measure>,
+  "temporal": <bool - true if query asks about trends/changes over time>,
   "start_year": <int or null>,
   "end_year": <int or null>,
-  "data_type_needed": "spatial_vector" | "change_raster" | "timeseries",
+  "data_type_needed": "spatial_vector" | "change_raster" | "timeseries" | "land_use_raster",
   "analysis_type": "temporal_vector" | "change_detection" | "state_aggregation" | "spatial_summary",
-  "recommended_layer": "cropping_intensity_vector" | "surface_water_bodies_vector" | 
-                       "change_tree_cover_loss_raster" | "change_urbanization_raster" | 
-                       "drought_frequency_vector" | "other",
-  "notes": <string with caveats if needed>
+  "recommended_layer": <exact layer name from list above>,
+  "notes": <string explaining caveats, e.g., "Single snapshot, use LULC for multi-year trends" or "Pre-computed 2017-2022 only, use LULC for custom periods">
 }}
 
-RULES:
-- If query mentions "years" or "trend" AND metric is cropping/water → data_type="spatial_vector" (NOT timeseries)
-- If query mentions "change", "loss", "gain", "conversion" → data_type="change_raster"
-- If query mentions state + drought → data_type="spatial_vector", analysis_type="state_aggregation"
-- Only use timeseries for watershed-level water balance (rare)
-"""
+DECISION RULES:
+1. If query mentions "over years" + spatial metric (cropping, water bodies) → spatial_vector (NOT timeseries)
+2. If query mentions "change"/"loss"/"gain" + 2017-2022 period → change_raster
+3. If query mentions custom time period (2018-2024) or non-standard years → land_use_raster + notes
+4. If query is about watershed water budget → timeseries
+5. If query is about state-level aggregation → spatial_vector + state_aggregation
+6. ALWAYS use exact layer names from the list above (case-sensitive)
+7. Add caveats in notes if data limitations exist (single snapshot, composite period, etc.)
+
+NOW PARSE THE QUERY:"""
 
     try:
         response = llm.invoke(prompt)
@@ -877,6 +1006,24 @@ RULES:
             if coords:
                 parsed['latitude'], parsed['longitude'] = coords
                 print(f"🌍 Geocoded '{parsed['location_name']}' → ({coords[0]:.5f}, {coords[1]:.5f})")
+        
+        # Map recommended_layer to exact CoreStack layer names (if abbreviated)
+        layer_name_mapping = {
+            "cropping_intensity_vector": "Cropping Intensity",
+            "surface_water_bodies_vector": "Surface Water Bodies",
+            "change_tree_cover_loss_raster": "Change Tree Cover Loss",
+            "change_urbanization_raster": "Change Urbanization",
+            "drought_frequency_vector": "Drought Frequency",
+            "change_cropping_reduction_raster": "Change Cropping Reduction",
+            "change_tree_cover_gain_raster": "Change Tree Cover Gain",
+            "land_use_land_cover_raster": "LULC_level_1",
+            "lulc_vector": "LULC"
+        }
+        
+        # Normalize layer name to exact CoreStack format
+        recommended = parsed.get('recommended_layer', '')
+        if recommended in layer_name_mapping:
+            parsed['recommended_layer'] = layer_name_mapping[recommended]
         
         state["parsed"] = parsed
         
@@ -894,50 +1041,101 @@ RULES:
     return state
 
 
-def fetch_spatial_layers(state: Dict[str, Any]) -> Dict[str, Any]:
+def fetch_spatial_layers_multiregion(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fetch available spatial layers for the location.
-    Uses COUPLED API workflow: get_admin_details_by_latlon → get_generated_layer_urls
+    Fetch spatial layers from ALL intersecting regions.
+    Accumulates URLs from multiple tehsils if village spans them.
     """
+    
     if "error" in state:
         return state
     
     print("\n" + "="*70)
-    print("📡 FETCHING SPATIAL LAYERS")
+    print("📥 FETCHING SPATIAL LAYERS (MULTI-REGION)")
     print("="*70)
     
     parsed = state["parsed"]
-    latitude = parsed.get("latitude")
-    longitude = parsed.get("longitude")
+    resolved = state.get("resolved_geometry", {})
+    tehsil_list = resolved.get("tehsil_list", [])
+    recommended_layer = parsed.get("recommended_layer", "")
     
-    if not latitude or not longitude:
-        state["error"] = "Coordinates required for spatial analysis"
+    if not tehsil_list:
+        state["error"] = "No tehsils resolved"
+        return state
+    
+    print(f"\n🔄 Fetching from {len(tehsil_list)} regions...")
+    print(f"   Target layer: {recommended_layer}")
+    
+    data_urls = {'vector': [], 'raster': []}
+    location_info = {}
+    
+    for tehsil_info in tehsil_list:
+        state_name = tehsil_info['state']
+        district_name = tehsil_info['district']
+        tehsil_name = tehsil_info['tehsil']
+        
+        print(f"\n   🔍 Fetching: {tehsil_name} ({district_name}, {state_name})")
+        
+        try:
+            # Get representative point from tehsil geometry
+            centroid = tehsil_info['geometry'].centroid
+            lat, lon = centroid.y, centroid.x
+            
+            # Call CoreStack API for this specific tehsil
+            admin_info = api.get_admin_details_by_latlon(
+                latitude=lat,
+                longitude=lon
+            )
+            
+            layers = api.get_generated_layer_urls(
+                state=state_name,
+                district=district_name,
+                tehsil=tehsil_name
+            )
+            
+            location_info = admin_info  # Store last location info
+            
+            # Filter to recommended layer
+            found_count = 0
+            for layer in layers:
+                if layer['layer_name'] == recommended_layer:
+                    layer_info = {
+                        'tehsil': tehsil_name,
+                        'district': district_name,
+                        'state': state_name,
+                        'layer_name': layer['layer_name'],
+                        'url': layer['layer_url'],
+                        'type': layer.get('layer_type', 'vector')
+                    }
+                    
+                    if layer.get('layer_type') == 'vector':
+                        data_urls['vector'].append(layer_info)
+                    elif layer.get('layer_type') == 'raster':
+                        data_urls['raster'].append(layer_info)
+                    
+                    found_count += 1
+                    print(f"      ✅ Found: {layer['layer_name']}")
+            
+            if found_count == 0:
+                print(f"      ⚠️  Layer '{recommended_layer}' not found in this tehsil")
+        
+        except Exception as e:
+            print(f"      ⚠️  Error fetching from {tehsil_name}: {str(e)}")
+            continue
+    
+    print(f"\n✅ FETCHING COMPLETE:")
+    print(f"   Vector layers: {len(data_urls['vector'])}")
+    print(f"   Raster layers: {len(data_urls['raster'])}")
+    
+    if len(data_urls['vector']) == 0 and len(data_urls['raster']) == 0:
+        state["error"] = f"Layer '{recommended_layer}' not found in any region"
         print(f"❌ ERROR: {state['error']}")
         return state
     
-    try:
-        # Use coupled API workflow
-        admin_info, layers = api.get_spatial_layers_by_coordinates(latitude, longitude)
-        
-        # Categorize layers by type
-        vector_layers = [l for l in layers if l.get('layer_type') == 'vector']
-        raster_layers = [l for l in layers if l.get('layer_type') == 'raster']
-        
-        state["available_layers"] = {
-            'vector': vector_layers,
-            'raster': raster_layers,
-            'all': layers
-        }
-        state["location_info"] = admin_info
-        
-        print(f"\n✅ SUCCESS: Retrieved {len(vector_layers)} vector + {len(raster_layers)} raster layers")
-        
-    except Exception as e:
-        state["error"] = str(e)
-        print(f"❌ ERROR: {state['error']}")
+    state["data_urls"] = data_urls
+    state["location_info"] = location_info
     
     return state
-
 
 def fetch_timeseries_data(state: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -979,6 +1177,143 @@ def fetch_timeseries_data(state: Dict[str, Any]) -> Dict[str, Any]:
     
     return state
 
+def merge_and_clip_spatial_data(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    NEW CRITICAL FUNCTION: Merge multi-region data and clip to exact boundary.
+    Handles both vector union and raster mosaic.
+    """
+    
+    if "error" in state:
+        return state
+    
+    print("\n" + "="*70)
+    print("🔗 MERGING & CLIPPING DATA")
+    print("="*70)
+    
+    data_urls = state.get("data_urls", {})
+    resolved = state.get("resolved_geometry", {})
+    village_geom = resolved.get("village_geom")
+    location_name = resolved.get("location_name")
+    
+    if not village_geom or (len(data_urls.get('vector', [])) == 0 and len(data_urls.get('raster', [])) == 0):
+        state["error"] = "No data to merge"
+        return state
+    
+    try:
+        # VECTOR MERGING PATH
+        if data_urls['vector']:
+            print(f"\n📦 Vector merging: {len(data_urls['vector'])} layers")
+            
+            all_gdf_list = []
+            for layer_info in data_urls['vector']:
+                print(f"   Loading: {layer_info['tehsil']} - {layer_info['layer_name']}")
+                gdf = gpd.read_file(layer_info['url'])
+                all_gdf_list.append(gdf)
+            
+            # Union all GeoDataFrames
+            print(f"   Unioning {len(all_gdf_list)} GeoDataFrames...")
+            merged_gdf = gpd.GeoDataFrame(
+                pd.concat(all_gdf_list, ignore_index=True),
+                crs=all_gdf_list[0].crs
+            )
+            
+            # Remove exact duplicates (same geometry)
+            print(f"   Removing duplicates...")
+            merged_gdf = merged_gdf.drop_duplicates(subset=['geometry'])
+            print(f"   Before dedup: {len(pd.concat(all_gdf_list))}, After: {len(merged_gdf)}")
+            
+            # Clip to village boundary
+            print(f"   Clipping to village boundary...")
+            clipped_gdf = gpd.clip(merged_gdf, village_geom)
+            
+            print(f"   ✅ Result: {len(clipped_gdf)} features within {location_name}")
+            
+            # Save for CodeAct
+            clipped_gdf.to_file('./exports/merged_clipped_data.geojson', driver='GeoJSON')
+            state["merged_data"] = clipped_gdf
+            state["merged_data_type"] = "vector"
+            state["merged_data_path"] = './exports/merged_clipped_data.geojson'
+        
+        # RASTER MERGING PATH
+        elif data_urls['raster']:
+            print(f"\n🖼️  Raster merging: {len(data_urls['raster'])} layers")
+            
+            import rasterio
+            from rasterio.merge import merge as rio_merge
+            from rasterio.mask import mask as rio_mask
+            from rasterio.vrt import WarpedVRT
+            
+            raster_paths = []
+            
+            # Download rasters (in real implementation, use /vsicurl/)
+            for layer_info in data_urls['raster']:
+                print(f"   Accessing: {layer_info['tehsil']} - {layer_info['layer_name']}")
+                # For HTTP URLs, use /vsicurl/ prefix for GDAL
+                url = layer_info['url']
+                if url.startswith('http') and not url.startswith('/vsicurl/'):
+                    url = f'/vsicurl/{url}'
+                raster_paths.append(url)
+            
+            # Mosaic rasters
+            if len(raster_paths) > 1:
+                print(f"   Mosaicking {len(raster_paths)} rasters...")
+                mosaicked, out_transform = rio_merge(raster_paths)
+                
+                with rasterio.open(raster_paths[0]) as src:
+                    merged_profile = src.profile
+                    merged_profile.update({
+                        'height': mosaicked.shape[1],
+                        'width': mosaicked.shape[2],
+                        'transform': out_transform
+                    })
+                
+                merged_path = './exports/merged_raster.tif'
+                with rasterio.open(merged_path, 'w', **merged_profile) as dst:
+                    dst.write(mosaicked)
+            else:
+                merged_path = raster_paths[0]
+                print(f"   Single raster, using as-is")
+            
+            # Clip to village boundary
+            print(f"   Clipping to village boundary...")
+            with rasterio.open(merged_path) as src:
+                try:
+                    clipped, clipped_transform = rio_mask(
+                        src,
+                        [village_geom],
+                        crop=True,
+                        filled=True
+                    )
+                    
+                    clipped_profile = src.profile
+                    clipped_profile.update({
+                        'height': clipped.shape[1],
+                        'width': clipped.shape[2],
+                        'transform': clipped_transform
+                    })
+                    
+                    clipped_path = './exports/merged_clipped_raster.tif'
+                    with rasterio.open(clipped_path, 'w', **clipped_profile) as dst:
+                        dst.write(clipped)
+                    
+                    print(f"   ✅ Clipped raster saved: {clipped_path}")
+                    
+                except Exception as e:
+                    print(f"   ⚠️  Clipping failed: {e}, using full raster")
+                    clipped_path = merged_path
+            
+            state["merged_data_path"] = clipped_path
+            state["merged_data_type"] = "raster"
+        
+        print(f"\n✅ MERGE & CLIP COMPLETE")
+        
+    except Exception as e:
+        state["error"] = f"Merge and clip failed: {str(e)}"
+        print(f"❌ ERROR: {state['error']}")
+        import traceback
+        traceback.print_exc()
+    
+    return state
 
 def codeact_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -1133,68 +1468,182 @@ Generate a user-friendly response:"""
     
     return state
 
-
+def resolve_geometry_v2(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    NEW CRITICAL FUNCTION: Resolve multi-region geometry.
+    Finds which tehsils/watersheds a village spans.
+    Returns exact boundary for clipping.
+    """
+    
+    if "error" in state:
+        return state
+    
+    print("\n" + "="*70)
+    print("🗺️  GEOMETRY RESOLUTION")
+    print("="*70)
+    
+    parsed = state["parsed"]
+    location_type = parsed.get("location_type")
+    location_name = parsed.get("location_name")
+    latitude = parsed.get("latitude")
+    longitude = parsed.get("longitude")
+    district = parsed.get("district")
+    
+    try:
+        if location_type == "village":
+            # Load village boundaries from YOUR GeoJSON
+            try:
+                village_gdf = gpd.read_file('./village_boundaries.geojson')
+            except:
+                # Fallback: load from GEE if local file not available
+                print("⚠️  Local village GeoJSON not found, loading from GEE...")
+                village_fc = ee.FeatureCollection("projects/ext-datasets/assets/datasets/Village_pan_india")
+                # This will be slow, but at least works
+                village_gdf = geemap.ee_to_geopandas(village_fc)
+            
+            # Filter to specific village
+            if district:
+                village = village_gdf[
+                    (village_gdf['village_name'].str.lower() == location_name.lower()) &
+                    (village_gdf['district'].str.lower() == district.lower())
+                ]
+            else:
+                village = village_gdf[village_gdf['village_name'].str.lower() == location_name.lower()]
+            
+            if len(village) == 0:
+                state["error"] = f"Village '{location_name}' in {district} not found"
+                print(f"❌ ERROR: {state['error']}")
+                return state
+            
+            village_geom = village.iloc[0].geometry
+            print(f"✅ Found village: {location_name}")
+            print(f"   Area: {village_geom.area:.4f} square degrees")
+        
+        elif location_type == "coordinates":
+            # Create small buffer around point
+            from shapely.geometry import Point
+            village_geom = Point(longitude, latitude).buffer(0.01)
+            print(f"✅ Using buffer around: ({latitude}, {longitude})")
+        
+        elif location_type == "state":
+            # Load state boundary
+            state_fc = ee.FeatureCollection("projects/ext-datasets/assets/datasets/State_pan_india")
+            state_gdf = geemap.ee_to_geopandas(state_fc)
+            state_geom = state_gdf[state_gdf['state_name'].str.lower() == location_name.lower()].geometry.iloc[0]
+            print(f"✅ Using state: {location_name}")
+            village_geom = state_geom
+        
+        elif location_type == "tehsil":
+            # Load tehsil boundary
+            tehsil_fc = ee.FeatureCollection("projects/ext-datasets/assets/datasets/SOI_tehsil")
+            tehsil_gdf = geemap.ee_to_geopandas(tehsil_fc)
+            tehsil = tehsil_gdf[tehsil_gdf['name'].str.lower() == location_name.lower()].iloc[0]
+            print(f"✅ Using tehsil: {location_name}")
+            village_geom = tehsil.geometry
+        
+        # Find intersecting tehsils
+        print(f"\n🔍 Finding intersecting tehsils...")
+        tehsil_fc = ee.FeatureCollection("projects/ext-datasets/assets/datasets/SOI_tehsil")
+        tehsil_gdf = geemap.ee_to_geopandas(tehsil_fc)
+        
+        intersecting_tehsils = tehsil_gdf[tehsil_gdf.geometry.intersects(village_geom)]
+        
+        tehsil_list = []
+        for idx, row in intersecting_tehsils.iterrows():
+            tehsil_list.append({
+                'state': row.get('state_name', row.get('state')),
+                'district': row.get('district_name', row.get('district')),
+                'tehsil': row.get('name'),
+                'geometry': row.geometry
+            })
+        
+        print(f"✅ Found {len(tehsil_list)} intersecting tehsils:")
+        for t in tehsil_list:
+            print(f"   - {t['tehsil']} ({t['district']}, {t['state']})")
+        
+        # Find intersecting watersheds (optional)
+        print(f"\n🔍 Finding intersecting watersheds...")
+        watershed_fc = ee.FeatureCollection("projects/ext-datasets/assets/datasets/Watershed_pan_india")
+        watershed_gdf = geemap.ee_to_geopandas(watershed_fc)
+        
+        intersecting_watersheds = watershed_gdf[watershed_gdf.geometry.intersects(village_geom)]
+        watershed_list = intersecting_watersheds['uid'].tolist() if 'uid' in intersecting_watersheds.columns else []
+        
+        print(f"✅ Found {len(watershed_list)} intersecting watersheds")
+        
+        state["resolved_geometry"] = {
+            'village_geom': village_geom,
+            'tehsil_list': tehsil_list,
+            'watershed_list': watershed_list,
+            'location_name': location_name,
+            'location_type': location_type
+        }
+        
+        print(f"\n✅ GEOMETRY RESOLUTION COMPLETE")
+        
+    except Exception as e:
+        state["error"] = f"Geometry resolution failed: {str(e)}"
+        print(f"❌ ERROR: {state['error']}")
+        import traceback
+        traceback.print_exc()
+    
+    return state
 # ============================================================================
 # LANGGRAPH SETUP
 # ============================================================================
 
 def router_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Route to appropriate processing path based on data type needed.
-    Routes: timeseries, spatial, or both
+    FIXED: Route based on analysis type, always include geometry resolution.
     """
+    
     if "error" in state:
+        print("🚫 Error detected, skipping to format")
         state["next_node"] = "format"
         return state
     
-    parsed = state["parsed"]
-    data_type = parsed.get("data_type_needed", "spatial")
-    
     print("\n" + "="*70)
-    print(f"🔀 ROUTING DECISION: {data_type}")
+    print("🚦 ROUTING DECISION")
     print("="*70)
     
-    if data_type == "timeseries":
-        state["next_node"] = "fetch_timeseries"
-    elif data_type in ["spatial", "vector", "raster", "both"]:
-        state["next_node"] = "fetch_spatial"
-    else:
-        # Default to spatial for safety
-        state["next_node"] = "fetch_spatial"
+    parsed = state["parsed"]
+    analysis_type = parsed.get("analysis_type")
     
-    print(f"➡️  Next node: {state['next_node']}")
+    print(f"   Analysis Type: {analysis_type}")
+    
+    # ALL queries go through geometry resolution first
+    state["next_node"] = "resolve_geometry"
+    
+    print(f"   → Next: resolve_geometry")
+    
     return state
 
 
 def build_graph() -> StateGraph:
-    """Build the LangGraph workflow with router"""
+    """
+    FIXED: Complete workflow with proper data collection phases.
+    """
     graph = StateGraph(dict)
     
     # Add nodes
     graph.add_node("parse_intent", llm_intent_parser)
     graph.add_node("router", router_node)
-    graph.add_node("fetch_spatial", fetch_spatial_layers)
-    graph.add_node("fetch_timeseries", fetch_timeseries_data)
+    
+    # NEW NODES (data collection)
+    graph.add_node("resolve_geometry", resolve_geometry_v2)
+    graph.add_node("fetch_spatial", fetch_spatial_layers_multiregion)
+    graph.add_node("merge_clip", merge_and_clip_spatial_data)
+    
+    # Existing nodes (execution)
     graph.add_node("codeact", codeact_node)
     graph.add_node("format", format_response)
     
-    # Add edges
+    # Add edges (LINEAR FLOW: no branching needed)
     graph.add_edge("parse_intent", "router")
-    
-    # Router conditional edges
-    graph.add_conditional_edges(
-        "router",
-        lambda x: x.get("next_node", "format"),
-        {
-            "fetch_spatial": "fetch_spatial",
-            "fetch_timeseries": "fetch_timeseries",
-            "format": "format"
-        }
-    )
-    
-    # Both paths lead to CodeAct
-    graph.add_edge("fetch_spatial", "codeact")
-    graph.add_edge("fetch_timeseries", "codeact")
+    graph.add_edge("router", "resolve_geometry")          # NEW
+    graph.add_edge("resolve_geometry", "fetch_spatial")   # NEW
+    graph.add_edge("fetch_spatial", "merge_clip")         # NEW
+    graph.add_edge("merge_clip", "codeact")
     graph.add_edge("codeact", "format")
     
     # Set entry and finish points
@@ -1202,7 +1651,6 @@ def build_graph() -> StateGraph:
     graph.set_finish_point("format")
     
     return graph
-
 
 # ============================================================================
 # MAIN RUNNER
@@ -1277,5 +1725,3 @@ if __name__ == "__main__":
     # Run first spatial query
     run_agent("How much cropland in Shirur, Dharwad, Karnataka has turned into built up since 2018? can you show me those regions?no")
 
-
-"""One more thing. I have this geogson of village boundries. Can this help with boundry level flexibility? I need you to spend time understnading the data products we have access to and putting them elegantly into a good workflow that we discussed on top. Understood? """
